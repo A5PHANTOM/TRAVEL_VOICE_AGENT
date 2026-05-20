@@ -1,0 +1,17 @@
+version: '3.8'
+services:
+  app:
+    build: .
+    ports:
+      - "7860:7860"
+    environment:
+      - DEEPGRAM_API_KEY
+      - GROQ_API_KEY
+      - OPENAI_API_KEY
+      - STUN_SERVER
+      - PORT=7860
+    volumes:
+      - data:/data
+
+volumes:
+  data:
