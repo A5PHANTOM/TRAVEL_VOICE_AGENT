@@ -67,7 +67,14 @@ async def register_interest(
     logger.info(f"Registering travel lead destination={destination_name} details={record}")
 
     try:
-        row_id = await save_interest(destination_name, record)
+        # If there's an open partial lead (same name + package, no email), update it
+        from app.database import find_open_lead, update_lead
+
+        existing_id = await find_open_lead(destination_name, lead_name)
+        if existing_id:
+            row_id = await update_lead(existing_id, destination_name, record)
+        else:
+            row_id = await save_interest(destination_name, record)
         result = {
             "status": "ok",
             "id": row_id,
