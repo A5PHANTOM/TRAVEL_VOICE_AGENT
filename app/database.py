@@ -1,9 +1,10 @@
 import json
+import os
 import aiosqlite
 from datetime import datetime, timezone
 from typing import Any
 
-DB_PATH = "/data/agents.db"
+DB_PATH = os.environ.get("DB_PATH", "/data/agents.db")
 
 
 async def init_db(path: str | None = None) -> None:

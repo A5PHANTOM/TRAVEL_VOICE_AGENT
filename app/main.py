@@ -16,6 +16,7 @@ from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -29,8 +30,8 @@ from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.groq.llm import GroqLLMService
 
-from app.functions import register_interest_handler
-from app.database import init_db
+from app.functions import register_interest
+from app.database import get_leads, init_db
 from app.api import router as api_router
 
 load_dotenv(override=True)
@@ -118,18 +119,20 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
             system_instruction=(
                 "You are a helpful travel assistant. Detect user intent and use function calls to "
                 "register user interest in travel packages. Keep responses concise and natural for TTS. "
-                "Do NOT display raw function-call syntax or slash-commands (for example, do not output "/register_interest(...)" to the user). "
-                "When you need to register interest, either call the registered function directly (no visible token) or ask the user in plain language (for example: "
-                "\"I can register you for the Dubai luxury package — would you like me to proceed?\"")
+                "Do NOT display raw function-call syntax or slash-commands. Never show tool names or token-like text to the user. "
+                "When you need to register interest, call the registered function directly and then speak a natural follow-up. "
+                "Before ending a booking conversation, always collect the client's email address for follow-up. "
+                "If the email is missing, ask for it in plain language and do not close the conversation until you have it. "
+                "If you need to ask a clarifying question, do so in plain language (for example: 'I can register you for the Dubai luxury package — could you share your email address so I can send the details?')"
             )
         ),
     )
 
     # Register function that will persist the user's interest
-    llm.register_function("register_interest", register_interest_handler)
+    llm.register_direct_function(register_interest)
 
     # Build pipeline
-    context = LLMContext()
+    context = LLMContext(tools=ToolsSchema(standard_tools=[register_interest]))
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context, user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer())
     )
@@ -212,6 +215,18 @@ async def start(request: Request):
         result["iceConfig"] = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
     return result
+
+
+@app.get("/report")
+async def report():
+    """Return all saved travel lead reports."""
+    return {"reports": await get_leads()}
+
+
+@app.get("/api/reports")
+async def api_reports():
+    """API alias for the saved reports list."""
+    return {"reports": await get_leads()}
 
 
 if __name__ == "__main__":

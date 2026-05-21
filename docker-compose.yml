@@ -10,8 +10,6 @@ services:
       - OPENAI_API_KEY
       - STUN_SERVER
       - PORT=7860
+      - DB_PATH=/data/agents.db
     volumes:
-      - data:/data
-
-volumes:
-  data:
+      - ./data:/data

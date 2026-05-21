@@ -23,6 +23,9 @@ env/
 # Local editable pipecat package and its build artifacts
 /pipecat/
 
+# Local database storage
+/data/
+
 # Editor directories and files
 .vscode/
 .idea/
