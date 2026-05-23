@@ -8,6 +8,10 @@ services:
       - DEEPGRAM_API_KEY
       - GROQ_API_KEY
       - OPENAI_API_KEY
+      - OPENAI_ADMIN_KEY
+      - TWILIO_ACCOUNT_SID
+      - TWILIO_AUTH_TOKEN
+      - PUBLIC_BASE_URL
       - STUN_SERVER
       - PORT=7860
       - DB_PATH=/data/agents.db
