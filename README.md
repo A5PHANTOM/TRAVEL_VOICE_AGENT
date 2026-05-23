@@ -6,7 +6,7 @@ Run locally with Docker Compose:
 
 ```bash
 cp .env.example .env
-# fill in DEEPGRAM_API_KEY and GROQ_API_KEY
+# fill in DEEPGRAM_API_KEY, GROQ_API_KEY, and TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN if using Twilio
 docker compose up --build
 ```
 

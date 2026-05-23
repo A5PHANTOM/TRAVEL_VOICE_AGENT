@@ -1,12 +1,13 @@
 import os
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from typing import Any
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket
+from fastapi.responses import RedirectResponse, Response
 from loguru import logger
 
 from pipecat_ai_small_webrtc_prebuilt.frontend import SmallWebRTCPrebuiltUI
@@ -22,9 +23,11 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
+from pipecat.serializers.twilio import TwilioFrameSerializer
 
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
@@ -68,6 +71,25 @@ def _get_llm_api_key() -> str:
     )
 
 
+def _get_public_base_url(request: Request | None = None) -> str:
+    public_base_url = (
+        os.environ.get("PUBLIC_BASE_URL", "")
+        or os.environ.get("TWILIO_PUBLIC_BASE_URL", "")
+        or os.environ.get("BASE_URL", "")
+    )
+    if public_base_url:
+        return public_base_url.rstrip("/")
+
+    if request is None:
+        raise RuntimeError("Missing PUBLIC_BASE_URL or TWILIO_PUBLIC_BASE_URL")
+
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", ""))
+    if not host:
+        raise RuntimeError("Unable to determine public base URL for Twilio")
+    return f"{scheme}://{host}".rstrip("/")
+
+
 async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: BackgroundTasks):
     pc_id = request_data.get("pc_id")
 
@@ -97,6 +119,15 @@ async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: B
 
 
 async def run_bot(webrtc_connection: SmallWebRTCConnection):
+    await _run_agent(
+        SmallWebRTCTransport(
+            webrtc_connection=webrtc_connection,
+            params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+        )
+    )
+
+
+async def _run_agent(transport: BaseTransport):
     logger.info("Starting Travel Voice Agent")
 
     api_key = _get_llm_api_key()
@@ -104,11 +135,6 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
         raise RuntimeError(
             "Missing LLM credentials. Set GROQ_API_KEY, OPENAI_API_KEY, or OPENAI_ADMIN_KEY."
         )
-
-    transport = SmallWebRTCTransport(
-        webrtc_connection=webrtc_connection,
-        params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
-    )
 
     stt = DeepgramSTTService(api_key=os.environ.get("DEEPGRAM_API_KEY", ""))
     tts = DeepgramTTSService(api_key=os.environ.get("DEEPGRAM_API_KEY", ""))
@@ -165,6 +191,40 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
     await runner.run(task)
 
 
+async def _run_twilio_bot(websocket: WebSocket):
+    await websocket.accept()
+
+    try:
+        start_data = json.loads(await websocket.receive_text())
+    except Exception as exc:
+        await websocket.close(code=1003)
+        logger.error(f"Invalid Twilio start message: {exc}")
+        return
+
+    if start_data.get("event") != "start" or "start" not in start_data:
+        await websocket.close(code=1003)
+        logger.error("Expected Twilio start event")
+        return
+
+    stream_id = start_data["start"].get("streamSid")
+    call_id = start_data["start"].get("callSid")
+    if not stream_id or not call_id:
+        await websocket.close(code=1003)
+        logger.error("Missing Twilio streamSid or callSid")
+        return
+
+    twilio_params = FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True)
+    twilio_params.serializer = TwilioFrameSerializer(
+        stream_sid=stream_id,
+        call_sid=call_id,
+        account_sid=os.environ.get("TWILIO_ACCOUNT_SID", ""),
+        auth_token=os.environ.get("TWILIO_AUTH_TOKEN", ""),
+    )
+
+    transport = FastAPIWebsocketTransport(websocket=websocket, params=twilio_params)
+    await _run_agent(transport)
+
+
 @app.get("/", include_in_schema=False)
 async def root_redirect():
     return RedirectResponse(url="/client/")
@@ -174,6 +234,29 @@ async def root_redirect():
 @app.patch("/api/offer")
 async def offer(request: dict, background_tasks: BackgroundTasks):
     return await _handle_webrtc_offer(request, background_tasks)
+
+
+@app.get("/twilio/voice")
+@app.post("/twilio/voice")
+async def twilio_voice(request: Request):
+    """Return TwiML that connects an incoming call to the Twilio media websocket."""
+    # Twilio requires a WebSocket URL (ws:// or wss://) for Media Streams.
+    public = _get_public_base_url(request)
+    from urllib.parse import urlparse
+
+    parsed = urlparse(public)
+    ws_scheme = "wss" if parsed.scheme in ("https", "wss") else "ws"
+    websocket_url = f"{ws_scheme}://{parsed.netloc}/twilio/media"
+    twiml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        f"<Response><Connect><Stream url=\"{websocket_url}\" /></Connect></Response>"
+    )
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.websocket("/twilio/media")
+async def twilio_media(websocket: WebSocket):
+    await _run_twilio_bot(websocket)
 
 
 @app.post("/sessions/{session_id}/api/offer")
