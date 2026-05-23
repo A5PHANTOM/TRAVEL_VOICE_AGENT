@@ -245,11 +245,21 @@ async def twilio_voice(request: Request):
     from urllib.parse import urlparse
 
     parsed = urlparse(public)
+    # Some deployments may provide a value without a netloc (e.g. missing scheme)
+    # Fallback to parsed.path if netloc is empty. Strip whitespace to avoid accidental newlines.
+    host = (parsed.netloc or parsed.path).strip().lstrip("/").rstrip("/")
     ws_scheme = "wss" if parsed.scheme in ("https", "wss") else "ws"
-    websocket_url = f"{ws_scheme}://{parsed.netloc}/twilio/media"
+    websocket_url = f"{ws_scheme}://{host}/twilio/media"
+    logger.debug(f"Twilio Stream URL: {websocket_url}")
+    # Add a short spoken prompt and pause so the call stays stable
+    # while Twilio establishes the media websocket.
     twiml = (
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-        f"<Response><Connect><Stream url=\"{websocket_url}\" /></Connect></Response>"
+        f"<Response>"
+        f"<Say voice=\"alice\">Connecting you to the agent. Please hold.</Say>"
+        f"<Pause length=\"2\"/>"
+        f"<Connect><Stream url=\"{websocket_url}\" /></Connect>"
+        f"</Response>"
     )
     return Response(content=twiml, media_type="application/xml")
 
