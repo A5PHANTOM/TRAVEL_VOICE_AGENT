@@ -192,37 +192,30 @@ async def _run_agent(transport: BaseTransport):
 
 
 async def _run_twilio_bot(websocket: WebSocket):
-    await websocket.accept()
+    """Create a telephony transport by delegating parsing to pipecat's runner utils.
+
+    Do NOT accept or consume websocket frames here; the FastAPIWebsocketTransport
+    and serializers expect to handle the protocol-level messages themselves.
+    """
+    logger.info("Twilio media websocket connected")
 
     try:
-        start_data = json.loads(await websocket.receive_text())
+        # Import runner utils which know how to parse telephony websockets and
+        # construct a configured FastAPIWebsocketTransport with the appropriate
+        # TwilioFrameSerializer (including stream/call ids).
+        from pipecat.runner.utils import parse_telephony_websocket, _create_telephony_transport
+
+        # Let the parser read the initial handshake messages and determine provider
+        transport_type, call_data = await parse_telephony_websocket(websocket)
+
+        params = FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True)
+
+        # _create_telephony_transport will set params.serializer appropriately
+        transport = await _create_telephony_transport(websocket, params, transport_type, call_data)
+
+        await _run_agent(transport)
     except Exception as exc:
-        await websocket.close(code=1003)
-        logger.error(f"Invalid Twilio start message: {exc}")
-        return
-
-    if start_data.get("event") != "start" or "start" not in start_data:
-        await websocket.close(code=1003)
-        logger.error("Expected Twilio start event")
-        return
-
-    stream_id = start_data["start"].get("streamSid")
-    call_id = start_data["start"].get("callSid")
-    if not stream_id or not call_id:
-        await websocket.close(code=1003)
-        logger.error("Missing Twilio streamSid or callSid")
-        return
-
-    twilio_params = FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True)
-    twilio_params.serializer = TwilioFrameSerializer(
-        stream_sid=stream_id,
-        call_sid=call_id,
-        account_sid=os.environ.get("TWILIO_ACCOUNT_SID", ""),
-        auth_token=os.environ.get("TWILIO_AUTH_TOKEN", ""),
-    )
-
-    transport = FastAPIWebsocketTransport(websocket=websocket, params=twilio_params)
-    await _run_agent(transport)
+        logger.exception(f"Twilio agent error: {exc}")
 
 
 @app.get("/", include_in_schema=False)
@@ -251,13 +244,10 @@ async def twilio_voice(request: Request):
     ws_scheme = "wss" if parsed.scheme in ("https", "wss") else "ws"
     websocket_url = f"{ws_scheme}://{host}/twilio/media"
     logger.debug(f"Twilio Stream URL: {websocket_url}")
-    # Add a short spoken prompt and pause so the call stays stable
-    # while Twilio establishes the media websocket.
+    # Return TwiML that immediately instructs Twilio to open the Media Stream.
     twiml = (
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
         f"<Response>"
-        f"<Say voice=\"alice\">Connecting you to the agent. Please hold.</Say>"
-        f"<Pause length=\"2\"/>"
         f"<Connect><Stream url=\"{websocket_url}\" /></Connect>"
         f"</Response>"
     )
@@ -266,7 +256,29 @@ async def twilio_voice(request: Request):
 
 @app.websocket("/twilio/media")
 async def twilio_media(websocket: WebSocket):
+    logger.info("Incoming Twilio websocket")
     await _run_twilio_bot(websocket)
+
+
+@app.get("/twilio/media")
+async def twilio_media_get(request: Request):
+    """HTTP GET diagnostic for the Twilio media endpoint.
+
+    Twilio or intermediaries may probe the WebSocket URL with a plain GET.
+    Return a simple 200 response so these probes do not log 404s.
+    The WebSocket upgrade will still be handled by the websocket route.
+    """
+    client_host = None
+    try:
+        client_host = request.client.host if request.client else None
+    except Exception:
+        client_host = None
+
+    logger.info(f"HTTP GET to /twilio/media from {client_host or 'unknown'} - returning 200")
+    return Response(
+        content="This endpoint upgrades to WebSocket for Twilio Media Streams.",
+        media_type="text/plain",
+    )
 
 
 @app.post("/sessions/{session_id}/api/offer")
