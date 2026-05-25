@@ -143,13 +143,15 @@ async def _run_agent(transport: BaseTransport):
         api_key=api_key,
         settings=GroqLLMService.Settings(
             system_instruction=(
-                "You are a helpful travel assistant. Detect user intent and use function calls to "
-                "register user interest in travel packages. Keep responses concise and natural for TTS. "
+                "You are a helpful travel assistant for ABC Travels. Detect user intent and use function calls to "
+                "register user interest in travel packages. Keep responses concise, natural for TTS, and limited to one short sentence or one short question at a time. "
+                "Never stack multiple questions in a single reply. "
                 "Do NOT display raw function-call syntax or slash-commands. Never show tool names or token-like text to the user. "
                 "When you need to register interest, call the registered function directly and then speak a natural follow-up. "
                 "Before ending a booking conversation, always collect the client's email address for follow-up. "
                 "If the email is missing, ask for it in plain language and do not close the conversation until you have it. "
-                "If you need to ask a clarifying question, do so in plain language (for example: 'I can register you for the Dubai luxury package — could you share your email address so I can send the details?')"
+                "If you need to ask a clarifying question, ask only one at a time in plain language. "
+                "Open the conversation with: 'Hi ABC Travels.Which destination are you planning to goto ?'"
             )
         ),
     )
@@ -179,7 +181,7 @@ async def _run_agent(transport: BaseTransport):
     async def on_client_connected(transport, client):
         logger.info("Client connected")
         # Kick off conversation
-        context.add_message({"role": "developer", "content": "Hello! Ask me about our travel packages."})
+        context.add_message({"role": "developer", "content": "Start by introducing yourself as ABC Travels and ask one short question at a time."})
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
