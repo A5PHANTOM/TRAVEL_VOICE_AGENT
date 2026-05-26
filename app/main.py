@@ -19,6 +19,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.frames.frames import TTSSpeakFrame, LLMRunFrame
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -201,10 +202,17 @@ async def _run_agent(transport: BaseTransport):
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
             logger.info("Client connected")
-            # Keep the first turn short so Exotel stays stable while the stream is active.
+            # Queue greeting frame directly to TTS service
+            # This will synthesize and emit audio frames to the output transport
+            logger.debug("Queueing greeting TTSSpeakFrame to TTS")
             await tts.queue_frame(TTSSpeakFrame("Hi, I'm calling from ABC Travels."))
+            logger.debug("Greeting frame queued")
             context.add_message({"role": "developer", "content": "Ask one short question at a time and keep the conversation concise."})
 
+            # After greeting, trigger LLM to generate opening question
+            logger.debug("Queueing LLMRunFrame to trigger opening question")
+            await llm.queue_frame(LLMRunFrame())
+            logger.debug("LLMRunFrame queued")
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
             logger.info("Client disconnected")
