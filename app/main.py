@@ -4,6 +4,7 @@ import json
 from contextlib import asynccontextmanager
 from typing import Any
 
+import aiohttp
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket
@@ -13,10 +14,11 @@ from loguru import logger
 from pipecat_ai_small_webrtc_prebuilt.frontend import SmallWebRTCPrebuiltUI
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -30,7 +32,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPI
 from pipecat.serializers.twilio import TwilioFrameSerializer
 
 from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.deepgram.tts import DeepgramTTSService
+from pipecat.services.deepgram.tts import DeepgramHttpTTSService
 from pipecat.services.groq.llm import GroqLLMService
 
 from app.functions import register_interest
@@ -136,59 +138,80 @@ async def _run_agent(transport: BaseTransport):
             "Missing LLM credentials. Set GROQ_API_KEY, OPENAI_API_KEY, or OPENAI_ADMIN_KEY."
         )
 
-    stt = DeepgramSTTService(api_key=os.environ.get("DEEPGRAM_API_KEY", ""))
-    tts = DeepgramTTSService(api_key=os.environ.get("DEEPGRAM_API_KEY", ""))
+    async with aiohttp.ClientSession() as session:
+        stt = DeepgramSTTService(api_key=os.environ.get("DEEPGRAM_API_KEY", ""))
+        tts = DeepgramHttpTTSService(
+            api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
+            sample_rate=8000,
+            encoding="linear16",
+            settings=DeepgramHttpTTSService.Settings(
+                voice="aura-2-andromeda-en",
+            ),
+            aiohttp_session=session,
+        )
 
-    llm = GroqLLMService(
-        api_key=api_key,
-        settings=GroqLLMService.Settings(
-            system_instruction=(
-                "You are a helpful travel assistant. Detect user intent and use function calls to "
-                "register user interest in travel packages. Keep responses concise and natural for TTS. "
-                "Do NOT display raw function-call syntax or slash-commands. Never show tool names or token-like text to the user. "
-                "When you need to register interest, call the registered function directly and then speak a natural follow-up. "
-                "Before ending a booking conversation, always collect the client's email address for follow-up. "
-                "If the email is missing, ask for it in plain language and do not close the conversation until you have it. "
-                "If you need to ask a clarifying question, do so in plain language (for example: 'I can register you for the Dubai luxury package — could you share your email address so I can send the details?')"
-            )
-        ),
-    )
+        llm = GroqLLMService(
+            api_key=api_key,
+            settings=GroqLLMService.Settings(
+                system_instruction=(
+                    "You are a helpful travel assistant for ABC Travels. Detect user intent and use function calls to "
+                    "register user interest in travel packages. Keep responses concise, natural for TTS, and limited to one short sentence or one short question at a time. "
+                    "Never stack multiple questions in a single reply. "
+                    "Do NOT display raw function-call syntax or slash-commands. Never show tool names or token-like text to the user. "
+                    "When you need to register interest, call the registered function directly and then speak a natural follow-up. "
+                    "Before ending a booking conversation, always collect the client's email address for follow-up. "
+                    "If the email is missing, ask for it in plain language and do not close the conversation until you have it. "
+                    "If you need to ask a clarifying question, ask only one at a time in plain language. "
+                    "Open the conversation with: 'Hi ABC Travels. Which destination are you planning to go to?'"
+                )
+            ),
+        )
 
-    # Register function that will persist the user's interest
-    llm.register_direct_function(register_interest)
+        # Register function that will persist the user's interest
+        llm.register_direct_function(register_interest)
 
-    # Build pipeline
-    context = LLMContext(tools=ToolsSchema(standard_tools=[register_interest]))
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context, user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer())
-    )
+        # Build pipeline
+        context = LLMContext(tools=ToolsSchema(standard_tools=[register_interest]))
+        user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+            context,
+            user_params=LLMUserAggregatorParams(
+                vad_analyzer=SileroVADAnalyzer(
+                    params=VADParams(
+                        confidence=0.5,
+                        start_secs=0.1,
+                        stop_secs=0.5,
+                        min_volume=0.2,
+                    )
+                )
+            ),
+        )
 
-    pipeline = Pipeline([
-        transport.input(),
-        stt,
-        user_aggregator,
-        llm,
-        tts,
-        transport.output(),
-        assistant_aggregator,
-    ])
+        pipeline = Pipeline([
+            transport.input(),
+            stt,
+            user_aggregator,
+            llm,
+            tts,
+            transport.output(),
+            assistant_aggregator,
+        ])
 
-    task = PipelineTask(pipeline, params=PipelineParams(enable_metrics=True, enable_usage_metrics=True))
+        task = PipelineTask(pipeline, params=PipelineParams(enable_metrics=True, enable_usage_metrics=True))
 
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        logger.info("Client connected")
-        # Kick off conversation
-        context.add_message({"role": "developer", "content": "Hello! Ask me about our travel packages."})
-        await task.queue_frames([LLMRunFrame()])
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            logger.info("Client connected")
+            # Keep the first turn short so Exotel stays stable while the stream is active.
+            await tts.queue_frame(TTSSpeakFrame("Hi, I'm calling from ABC Travels."))
+            context.add_message({"role": "developer", "content": "Ask one short question at a time and keep the conversation concise."})
 
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
-        logger.info("Client disconnected")
-        await task.cancel()
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info("Client disconnected")
+            await task.cancel()
 
-    runner = PipelineRunner(handle_sigint=False)
-    await runner.run(task)
+        runner = PipelineRunner(handle_sigint=False)
+        await runner.run(task)
 
 
 async def _run_twilio_bot(websocket: WebSocket):
@@ -260,6 +283,27 @@ async def twilio_media(websocket: WebSocket):
     await _run_twilio_bot(websocket)
 
 
+@app.websocket("/exotel/media")
+async def exotel_media(websocket: WebSocket):
+    try:
+        from pipecat.runner.utils import _create_telephony_transport, parse_telephony_websocket
+
+        logger.info("Exotel voicebot websocket connected")
+
+        transport_type, call_data = await parse_telephony_websocket(websocket)
+        logger.info(f"Detected telephony provider: {transport_type}")
+
+        if transport_type != "exotel":
+            raise RuntimeError(f"Unexpected telephony provider for /exotel/media: {transport_type}")
+
+        params = FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True)
+        transport = await _create_telephony_transport(websocket, params, transport_type, call_data)
+
+        await _run_agent(transport)
+    except Exception as e:
+        logger.exception(f"Exotel voicebot error: {e}")
+
+
 @app.get("/twilio/media")
 async def twilio_media_get(request: Request):
     """HTTP GET diagnostic for the Twilio media endpoint.
@@ -277,6 +321,22 @@ async def twilio_media_get(request: Request):
     logger.info(f"HTTP GET to /twilio/media from {client_host or 'unknown'} - returning 200")
     return Response(
         content="This endpoint upgrades to WebSocket for Twilio Media Streams.",
+        media_type="text/plain",
+    )
+
+
+@app.get("/exotel/media")
+async def exotel_media_get(request: Request):
+    """HTTP GET diagnostic for the Exotel media endpoint."""
+    client_host = None
+    try:
+        client_host = request.client.host if request.client else None
+    except Exception:
+        client_host = None
+
+    logger.info(f"HTTP GET to /exotel/media from {client_host or 'unknown'} - returning 200")
+    return Response(
+        content="This endpoint upgrades to WebSocket for Exotel voicebot media streams.",
         media_type="text/plain",
     )
 
