@@ -143,8 +143,6 @@ async def _run_agent(transport: BaseTransport):
         stt = DeepgramSTTService(api_key=os.environ.get("DEEPGRAM_API_KEY", ""))
         tts = DeepgramHttpTTSService(
             api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
-            sample_rate=8000,
-            encoding="linear16",
             settings=DeepgramHttpTTSService.Settings(
                 voice="aura-2-andromeda-en",
             ),
