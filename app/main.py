@@ -18,9 +18,10 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.frames.frames import TTSSpeakFrame
-from pipecat.frames.frames import TTSSpeakFrame, LLMRunFrame
+from pipecat.frames.frames import TTSSpeakFrame, LLMRunFrame, EndFrame, BotStoppedSpeakingFrame, Frame
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -130,7 +131,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
     )
 
 
-async def _run_agent(transport: BaseTransport):
+async def _run_agent(transport: BaseTransport, caller_number: str | None = None, call_id: str | None = None):
     logger.info("Starting Travel Voice Agent")
 
     api_key = _get_llm_api_key()
@@ -138,6 +139,77 @@ async def _run_agent(transport: BaseTransport):
         raise RuntimeError(
             "Missing LLM credentials. Set GROQ_API_KEY, OPENAI_API_KEY, or OPENAI_ADMIN_KEY."
         )
+
+    end_session_after_speaking = False
+
+    class SessionEnder(FrameProcessor):
+        async def process_frame(self, frame: Frame, direction: FrameDirection):
+            await super().process_frame(frame, direction)
+            if isinstance(frame, BotStoppedSpeakingFrame) and end_session_after_speaking:
+                logger.info("Ending session gracefully after transfer message spoken")
+                await self.push_frame(EndFrame())
+
+    session_ender = SessionEnder()
+
+    async def transfer_to_human(params: FunctionCallParams):
+        """Initiates a cold transfer to a human support agent when requested by the user."""
+        nonlocal end_session_after_speaking
+        logger.info("TRANSFER REQUESTED")
+        logger.info(f"Caller: {caller_number}")
+
+        if not caller_number:
+            logger.error("No caller number available for transfer")
+            await params.result_callback({
+                "status": "error",
+                "message": "No caller number available for transfer"
+            })
+            return
+
+        account_sid = os.environ.get("EXOTEL_ACCOUNT_SID", "")
+        exotel_api_key = os.environ.get("EXOTEL_API_KEY", "")
+        exotel_api_token = os.environ.get("EXOTEL_API_TOKEN", "")
+        support_number = os.environ.get("SUPPORT_NUMBER", "")
+        caller_id = os.environ.get("CALLER_ID", "")
+
+        if not all([account_sid, exotel_api_key, exotel_api_token, support_number, caller_id]):
+            logger.error("Missing one or more Exotel transfer credentials/configuration environment variables")
+            await params.result_callback({
+                "status": "error",
+                "message": "Transfer configuration error"
+            })
+            return
+
+        url = f"https://api.exotel.com/v1/Accounts/{account_sid}/Calls/connect"
+        auth = aiohttp.BasicAuth(exotel_api_key, exotel_api_token)
+        payload = {
+            "From": support_number,
+            "To": caller_number,
+            "CallerId": caller_id,
+            "Record": "true"
+        }
+
+        try:
+            async with session.post(url, auth=auth, data=payload) as response:
+                response_text = await response.text()
+                logger.info(f"Response: {response_text}")
+                if response.status in (200, 201):
+                    end_session_after_speaking = True
+                    await params.result_callback({
+                        "status": "success",
+                        "message": "Transfer initiated successfully."
+                    })
+                else:
+                    logger.error(f"Exotel transfer API failed with status {response.status}: {response_text}")
+                    await params.result_callback({
+                        "status": "failed",
+                        "message": "Transfer API failed"
+                    })
+        except Exception as e:
+            logger.exception(f"Error calling Exotel transfer API: {e}")
+            await params.result_callback({
+                "status": "error",
+                "error": str(e)
+            })
 
     async with aiohttp.ClientSession() as session:
         stt = DeepgramSTTService(api_key=os.environ.get("DEEPGRAM_API_KEY", ""))
@@ -161,16 +233,18 @@ async def _run_agent(transport: BaseTransport):
                     "Before ending a booking conversation, always collect the client's email address for follow-up. "
                     "If the email is missing, ask for it in plain language and do not close the conversation until you have it. "
                     "If you need to ask a clarifying question, ask only one at a time in plain language. "
+                    "If the user requests a human, customer support, representative, real person, or transfer, immediately call transfer_to_human(). Do not ask follow-up questions. After calling the function, say: 'Please hold while I connect you to a human agent.' "
                     "Open the conversation with: 'Hi ABC Travels. Which destination are you planning to go to?'"
                 )
             ),
         )
 
-        # Register function that will persist the user's interest
+        # Register functions
         llm.register_direct_function(register_interest)
+        llm.register_direct_function(transfer_to_human)
 
         # Build pipeline
-        context = LLMContext(tools=ToolsSchema(standard_tools=[register_interest]))
+        context = LLMContext(tools=ToolsSchema(standard_tools=[register_interest, transfer_to_human]))
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context,
             user_params=LLMUserAggregatorParams(
@@ -184,6 +258,7 @@ async def _run_agent(transport: BaseTransport):
             user_aggregator,
             llm,
             tts,
+            session_ender,
             transport.output(),
             assistant_aggregator,
         ])
@@ -298,7 +373,9 @@ async def exotel_media(websocket: WebSocket):
         params = FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True)
         transport = await _create_telephony_transport(websocket, params, transport_type, call_data)
 
-        await _run_agent(transport)
+        caller_number = call_data.get("from")
+        call_id = call_data.get("call_id")
+        await _run_agent(transport, caller_number=caller_number, call_id=call_id)
     except Exception as e:
         logger.exception(f"Exotel voicebot error: {e}")
 
