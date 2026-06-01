@@ -11,3 +11,13 @@ docker compose up --build
 ```
 
 Open: http://localhost:7860/client/
+
+## Make an Outbound Call (Twilio)
+
+To trigger an outbound call to a target phone number using Twilio:
+
+1. Ensure `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM` (your Twilio phone number), and `PUBLIC_BASE_URL` (your public ngrok URL) are filled in your `.env` file.
+2. Run the outbound call script:
+   ```bash
+   bash scripts/run_call.sh --to +1555XXXXXXX
+   ```

@@ -19,9 +19,9 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.frames.frames import TTSSpeakFrame, LLMRunFrame, EndFrame, BotStoppedSpeakingFrame, Frame
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.llm_service import FunctionCallParams
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -131,7 +131,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
     )
 
 
-async def _run_agent(transport: BaseTransport, caller_number: str | None = None, call_id: str | None = None):
+async def _run_agent(transport: BaseTransport, call_id: str | None = None):
     logger.info("Starting Travel Voice Agent")
 
     api_key = _get_llm_api_key()
@@ -139,77 +139,6 @@ async def _run_agent(transport: BaseTransport, caller_number: str | None = None,
         raise RuntimeError(
             "Missing LLM credentials. Set GROQ_API_KEY, OPENAI_API_KEY, or OPENAI_ADMIN_KEY."
         )
-
-    end_session_after_speaking = False
-
-    class SessionEnder(FrameProcessor):
-        async def process_frame(self, frame: Frame, direction: FrameDirection):
-            await super().process_frame(frame, direction)
-            if isinstance(frame, BotStoppedSpeakingFrame) and end_session_after_speaking:
-                logger.info("Ending session gracefully after transfer message spoken")
-                await self.push_frame(EndFrame())
-
-    session_ender = SessionEnder()
-
-    async def transfer_to_human(params: FunctionCallParams):
-        """Initiates a cold transfer to a human support agent when requested by the user."""
-        nonlocal end_session_after_speaking
-        logger.info("TRANSFER REQUESTED")
-        logger.info(f"Caller: {caller_number}")
-
-        if not caller_number:
-            logger.error("No caller number available for transfer")
-            await params.result_callback({
-                "status": "error",
-                "message": "No caller number available for transfer"
-            })
-            return
-
-        account_sid = os.environ.get("EXOTEL_ACCOUNT_SID", "")
-        exotel_api_key = os.environ.get("EXOTEL_API_KEY", "")
-        exotel_api_token = os.environ.get("EXOTEL_API_TOKEN", "")
-        support_number = os.environ.get("SUPPORT_NUMBER", "")
-        caller_id = os.environ.get("CALLER_ID", "")
-
-        if not all([account_sid, exotel_api_key, exotel_api_token, support_number, caller_id]):
-            logger.error("Missing one or more Exotel transfer credentials/configuration environment variables")
-            await params.result_callback({
-                "status": "error",
-                "message": "Transfer configuration error"
-            })
-            return
-
-        url = f"https://api.exotel.com/v1/Accounts/{account_sid}/Calls/connect"
-        auth = aiohttp.BasicAuth(exotel_api_key, exotel_api_token)
-        payload = {
-            "From": support_number,
-            "To": caller_number,
-            "CallerId": caller_id,
-            "Record": "true"
-        }
-
-        try:
-            async with session.post(url, auth=auth, data=payload) as response:
-                response_text = await response.text()
-                logger.info(f"Response: {response_text}")
-                if response.status in (200, 201):
-                    end_session_after_speaking = True
-                    await params.result_callback({
-                        "status": "success",
-                        "message": "Transfer initiated successfully."
-                    })
-                else:
-                    logger.error(f"Exotel transfer API failed with status {response.status}: {response_text}")
-                    await params.result_callback({
-                        "status": "failed",
-                        "message": "Transfer API failed"
-                    })
-        except Exception as e:
-            logger.exception(f"Error calling Exotel transfer API: {e}")
-            await params.result_callback({
-                "status": "error",
-                "error": str(e)
-            })
 
     async with aiohttp.ClientSession() as session:
         stt = DeepgramSTTService(api_key=os.environ.get("DEEPGRAM_API_KEY", ""))
@@ -220,6 +149,49 @@ async def _run_agent(transport: BaseTransport, caller_number: str | None = None,
             ),
             aiohttp_session=session,
         )
+
+        end_session_after_speaking = False
+
+        async def transfer_to_human(params: FunctionCallParams):
+            """Connects the caller to a human agent/supervisor. Call this immediately when the user requests to speak to a representative, support, agent, or human."""
+            nonlocal end_session_after_speaking
+            logger.info(f"TRANSFER REQUESTED for Call SID: {call_id}")
+            if not call_id:
+                logger.error("No active call_id available for transfer")
+                await params.result_callback({"status": "failed", "message": "No active call ID found."})
+                return
+
+            account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+            auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+            supervisor_number = os.environ.get("SUPERVISOR_NUMBER")
+
+            if not account_sid or not auth_token or not supervisor_number:
+                logger.error("Missing Twilio credentials or supervisor number in environment")
+                await params.result_callback({"status": "failed", "message": "Twilio configuration error."})
+                return
+
+            url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls/{call_id}.json"
+            twiml_content = f"<Response><Dial>{supervisor_number}</Dial></Response>"
+            
+            logger.info(f"Initiating redirect to {supervisor_number} on call {call_id} using URL {url}")
+            
+            try:
+                auth = aiohttp.BasicAuth(account_sid, auth_token)
+                data = {
+                    "Twiml": twiml_content
+                }
+                async with session.post(url, auth=auth, data=data) as resp:
+                    resp_text = await resp.text()
+                    logger.info(f"Twilio API Response Status: {resp.status}")
+                    logger.info(f"Twilio API Response Body: {resp_text}")
+                    if resp.status in (200, 201):
+                        end_session_after_speaking = True
+                        await params.result_callback({"status": "success", "message": "Transfer initiated successfully."})
+                    else:
+                        await params.result_callback({"status": "failed", "message": f"Twilio API failed with status {resp.status}."})
+            except Exception as e:
+                logger.exception(f"Error calling Twilio API: {e}")
+                await params.result_callback({"status": "failed", "message": f"Exception during Twilio API call: {str(e)}"})
 
         llm = GroqLLMService(
             api_key=api_key,
@@ -251,6 +223,16 @@ async def _run_agent(transport: BaseTransport, caller_number: str | None = None,
                 vad_analyzer=SileroVADAnalyzer()
             ),
         )
+
+        class SessionEnder(FrameProcessor):
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                await self.push_frame(frame, direction)
+                if isinstance(frame, BotStoppedSpeakingFrame) and end_session_after_speaking:
+                    logger.info("Gracefully ending AI session after hand-off message")
+                    await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+
+        session_ender = SessionEnder()
 
         pipeline = Pipeline([
             transport.input(),
@@ -310,7 +292,8 @@ async def _run_twilio_bot(websocket: WebSocket):
         # _create_telephony_transport will set params.serializer appropriately
         transport = await _create_telephony_transport(websocket, params, transport_type, call_data)
 
-        await _run_agent(transport)
+        call_id = call_data.get("call_id")
+        await _run_agent(transport, call_id=call_id)
     except Exception as exc:
         logger.exception(f"Twilio agent error: {exc}")
 
@@ -373,9 +356,7 @@ async def exotel_media(websocket: WebSocket):
         params = FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True)
         transport = await _create_telephony_transport(websocket, params, transport_type, call_data)
 
-        caller_number = call_data.get("from")
-        call_id = call_data.get("call_id")
-        await _run_agent(transport, caller_number=caller_number, call_id=call_id)
+        await _run_agent(transport)
     except Exception as e:
         logger.exception(f"Exotel voicebot error: {e}")
 
