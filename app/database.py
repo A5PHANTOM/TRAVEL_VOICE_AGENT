@@ -20,6 +20,15 @@ async def init_db(path: str | None = None) -> None:
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transfers (
+                call_id TEXT PRIMARY KEY,
+                context TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            )
+            """
+        )
         await db.commit()
 
 
@@ -89,3 +98,25 @@ async def get_leads() -> list[dict]:
     for r in rows:
         result.append({"id": r[0], "package": r[1], "lead": json.loads(r[2] or "{}"), "timestamp": r[3]})
     return result
+
+
+async def save_transfer_context(call_id: str, context: str) -> None:
+    db_path = DB_PATH
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO transfers (call_id, context, timestamp) VALUES (?, ?, ?)",
+            (call_id, context, now),
+        )
+        await db.commit()
+
+
+async def get_transfer_context(call_id: str) -> str | None:
+    db_path = DB_PATH
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(
+            "SELECT context FROM transfers WHERE call_id = ?",
+            (call_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None

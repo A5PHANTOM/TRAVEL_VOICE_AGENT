@@ -17,3 +17,5 @@ services:
       - DB_PATH=/data/agents.db
     volumes:
       - ./data:/data
+      - ./app:/app/app
+      - ./scratch:/app/scratch

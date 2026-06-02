@@ -170,10 +170,60 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None):
                 await params.result_callback({"status": "failed", "message": "Twilio configuration error."})
                 return
 
+            # Extract conversation context summary from LLMContext
+            destination = "Not specified"
+            email = "Not specified"
+            name = "Not specified"
+            for msg in context.get_messages():
+                if msg.get("role") == "assistant" and "tool_calls" in msg:
+                    for tc in msg["tool_calls"]:
+                        if tc.get("type") == "function" and tc.get("function", {}).get("name") == "register_interest":
+                            try:
+                                args = json.loads(tc["function"]["arguments"])
+                                if args.get("destination"):
+                                    destination = args.get("destination")
+                                if args.get("lead_email"):
+                                    email = args.get("lead_email")
+                                if args.get("lead_name"):
+                                    name = args.get("lead_name")
+                            except Exception:
+                                pass
+
+            # Fallback to scanning messages for email if not set
+            if email == "Not specified":
+                import re
+                email_regex = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
+                for msg in context.get_messages():
+                    if msg.get("role") == "user" and msg.get("content"):
+                        matches = email_regex.findall(msg.get("content"))
+                        if matches:
+                            email = matches[0]
+                            break
+
+            summary = f"Destination: {destination}. Client Name: {name}. Email: {email}."
+            logger.info(f"Generated warm transfer context: {summary}")
+
+            # Save the transfer context in the SQLite DB
+            from app.database import save_transfer_context
+            try:
+                await save_transfer_context(call_id, summary)
+            except Exception as db_err:
+                logger.error(f"Failed to save transfer context to DB: {db_err}")
+
+            # Twilio update call URL
             url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls/{call_id}.json"
-            twiml_content = f"<Response><Dial>{supervisor_number}</Dial></Response>"
             
-            logger.info(f"Initiating redirect to {supervisor_number} on call {call_id} using URL {url}")
+            public_base_url = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+            whisper_url = f"{public_base_url}/twilio/whisper?call_id={call_id}"
+            twiml_content = (
+                f"<Response>"
+                f"<Dial>"
+                f"<Number url=\"{whisper_url}\">{supervisor_number}</Number>"
+                f"</Dial>"
+                f"</Response>"
+            )
+            
+            logger.info(f"Initiating redirect to {supervisor_number} on call {call_id} using URL {url} with TwiML screen URL {whisper_url}")
             
             try:
                 auth = aiohttp.BasicAuth(account_sid, auth_token)
@@ -198,7 +248,9 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None):
             settings=GroqLLMService.Settings(
                 system_instruction=(
                     "You are a helpful travel assistant for ABC Travels. Detect user intent and use function calls to "
-                    "register user interest in travel packages. Keep responses concise, natural for TTS, and limited to one short sentence or one short question at a time. "
+                    "register user interest in travel packages. To gather client details, you must ask questions one by one in the following strict order: "
+                    "(1) Destination, (2) Client Name, (3) Email Address, (4) Travel Duration in days, (5) Accommodation class (budget/mid-range/luxury), and (6) Flight requirements. "
+                    "Do not ask for multiple details at once. Keep responses concise, natural for TTS, and limited to one short sentence or one short question at a time. "
                     "Never stack multiple questions in a single reply. "
                     "Do NOT display raw function-call syntax or slash-commands. Never show tool names or token-like text to the user. "
                     "When you need to register interest, call the registered function directly and then speak a natural follow-up. "
@@ -338,6 +390,35 @@ async def twilio_voice(request: Request):
 async def twilio_media(websocket: WebSocket):
     logger.info("Incoming Twilio websocket")
     await _run_twilio_bot(websocket)
+
+
+@app.get("/twilio/whisper")
+@app.post("/twilio/whisper")
+async def twilio_whisper(request: Request):
+    """Play a summary of the conversation to the supervisor before bridging the call."""
+    call_id = request.query_params.get("call_id")
+    logger.info(f"Twilio whisper requested for call_id: {call_id}")
+
+    from app.database import get_transfer_context
+    context_text = None
+    if call_id:
+        try:
+            context_text = await get_transfer_context(call_id)
+        except Exception as e:
+            logger.error(f"Failed to load transfer context: {e}")
+
+    if not context_text:
+        context_text = "No conversation summary available."
+
+    logger.info(f"Whispering context to supervisor: {context_text}")
+
+    twiml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Response>"
+        f"<Say>Incoming warm transfer from ABC Travels. Summary of conversation: {context_text}. Connecting you to the caller now.</Say>"
+        "</Response>"
+    )
+    return Response(content=twiml, media_type="application/xml")
 
 
 @app.websocket("/exotel/media")
