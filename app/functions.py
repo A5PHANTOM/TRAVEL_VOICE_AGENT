@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Any
 
 from loguru import logger
@@ -15,9 +16,61 @@ def _offered_packages() -> set[str]:
     return {p.casefold() for p in items}
 
 
+def _normalize_text(value: str | None) -> str:
+    return (value or "").strip()
+
+
+def _is_placeholder_destination(value: str) -> bool:
+    normalized = value.casefold().strip()
+    normalized = re.sub(r"[^a-z0-9\s-]", "", normalized)
+    return normalized in {
+        "",
+        "unknown",
+        "not specified",
+        "n/a",
+        "na",
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "sure",
+        "ok",
+        "okay",
+        "hi",
+        "hello",
+        "hey",
+    }
+
+
+def _is_placeholder_name(value: str) -> bool:
+    normalized = value.casefold().strip()
+    normalized = re.sub(r"[^a-z\s-]", "", normalized)
+    return normalized in {
+        "",
+        "unknown",
+        "not specified",
+        "n a",
+        "na",
+        "yes",
+        "yeah",
+        "yep",
+        "hi",
+        "hello",
+        "hey",
+    }
+
+
+def _is_valid_email(value: str) -> bool:
+    return bool(re.fullmatch(r"[\w\.-]+@[\w\.-]+\.\w+", value))
+
+
+def _is_valid_accommodation(value: str) -> bool:
+    return value.casefold() in {"budget", "mid-range", "mid range", "luxury"}
+
+
 async def register_interest(
     params: FunctionCallParams,
-    destination: str,
+    destination: str | None = None,
     package_type: str | None = None,
     duration_days: int | None = None,
     accommodation: str | None = None,
@@ -38,8 +91,8 @@ async def register_interest(
         lead_email (str | None): Email for follow-up.
         notes (str | None): Any extra notes from the conversation.
     """
-    destination_name = destination.strip() or "unknown"
-    if not destination_name or destination_name.lower() in ("unknown", "not specified"):
+    destination_name = _normalize_text(destination)
+    if _is_placeholder_destination(destination_name):
         await params.result_callback(
             {
                 "status": "needs_destination",
@@ -48,8 +101,8 @@ async def register_interest(
         )
         return
 
-    name = (lead_name or "").strip()
-    if not name or name.lower() in ("not specified", "unknown"):
+    name = _normalize_text(lead_name)
+    if _is_placeholder_name(name):
         await params.result_callback(
             {
                 "status": "needs_name",
@@ -58,8 +111,8 @@ async def register_interest(
         )
         return
 
-    email = (lead_email or "").strip()
-    if not email or email.lower() in ("not specified", "unknown"):
+    email = _normalize_text(lead_email)
+    if not _is_valid_email(email):
         await params.result_callback(
             {
                 "status": "needs_email",
@@ -68,7 +121,7 @@ async def register_interest(
         )
         return
 
-    if duration_days is None:
+    if duration_days is None or duration_days <= 0:
         await params.result_callback(
             {
                 "status": "needs_duration",
@@ -77,8 +130,8 @@ async def register_interest(
         )
         return
 
-    accommodation_val = (accommodation or "").strip()
-    if not accommodation_val or accommodation_val.lower() in ("not specified", "unknown"):
+    accommodation_val = _normalize_text(accommodation)
+    if not _is_valid_accommodation(accommodation_val):
         await params.result_callback(
             {
                 "status": "needs_accommodation",

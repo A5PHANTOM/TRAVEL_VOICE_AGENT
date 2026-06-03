@@ -90,6 +90,8 @@ class TestAICFilterIntegration(unittest.IsolatedAsyncioTestCase):
              patch("app.main.LLMContextAggregatorPair", return_value=(MagicMock(), MagicMock())) as mock_agg_pair, \
              patch("app.main.PipelineRunner") as mock_runner:
             
+            mock_runner.return_value.run = AsyncMock()
+            
             # Run agent with aic_filter = None, which should use SileroVADAnalyzer directly
             await main_mod._run_agent(mock_transport, aic_filter=None)
             
@@ -123,11 +125,10 @@ class TestAICFilterIntegration(unittest.IsolatedAsyncioTestCase):
              patch("app.main.LLMContextAggregatorPair", return_value=(MagicMock(), MagicMock())) as mock_agg_pair, \
              patch("app.main.PipelineRunner") as mock_runner:
             
+            mock_runner.return_value.run = AsyncMock()
+            
             # Run agent with mock aic_filter
-            try:
-                await main_mod._run_agent(mock_transport, aic_filter=mock_aic_filter)
-            except Exception:
-                pass
+            await main_mod._run_agent(mock_transport, aic_filter=mock_aic_filter)
             
             # Verify the StartupProtectedAICVADAnalyzer was created with correct args
             mock_protected_vad_class.assert_called_once()

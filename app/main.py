@@ -29,6 +29,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.turns.user_start import VADUserTurnStartStrategy, TranscriptionUserTurnStartStrategy
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_mute import MuteUntilFirstBotCompleteUserMuteStrategy
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
@@ -427,27 +428,37 @@ class DynamicToolManager(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
+        # Skip all processing until the pipeline has been properly started.
+        # pre-StartFrame frames (audio, ClientConnectedFrame, etc.) arrive
+        # before the pipeline task manager is initialized and would produce
+        # a flood of harmless-but-noisy "StartFrame not received yet" errors.
+        # FrameProcessor sets self.__started in its __start() which is
+        # name-mangled to _FrameProcessor__started.
+        if not getattr(self, "_FrameProcessor__started", False):
+            return
+
         # Scan user messages for human transfer request keywords
         user_requested = False
         for msg in self._context.get_messages():
             if msg.get("role") == "user" and msg.get("content"):
                 content_lower = msg["content"].lower()
                 if any(kw in content_lower for kw in [
-                    "human", "agent", "representative", "support", "supervisor", 
-                    "person", "operator", "transfer", "connect", 
-                    "speak", "talk", "someone", "somebody", "help desk", 
+                    "human", "agent", "representative", "support", "supervisor",
+                    "person", "operator", "transfer", "connect",
+                    "speak", "talk", "someone", "somebody", "help desk",
                     "put me through", "customer care", "customer service"
                 ]):
                     user_requested = True
                     break
-        
+
         # Dynamically set standard tools based on user request keywords presence
         from pipecat.adapters.schemas.tools_schema import ToolsSchema
         if user_requested:
             self._context.set_tools(ToolsSchema(standard_tools=[self._register_interest, self._transfer_to_human]))
         else:
             self._context.set_tools(ToolsSchema(standard_tools=[self._register_interest]))
-            
+
         await self.push_frame(frame, direction)
 
 
@@ -631,6 +642,7 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
             context,
             user_params=LLMUserAggregatorParams(
                 vad_analyzer=vad_analyzer,
+                user_mute_strategies=[MuteUntilFirstBotCompleteUserMuteStrategy()],
                 user_turn_strategies=UserTurnStrategies(
                     start=[
                         VADUserTurnStartStrategy(enable_interruptions=True),
