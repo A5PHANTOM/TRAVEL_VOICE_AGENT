@@ -90,15 +90,21 @@ class TestAICFilterIntegration(unittest.IsolatedAsyncioTestCase):
              patch("app.main.LLMContextAggregatorPair", return_value=(MagicMock(), MagicMock())) as mock_agg_pair, \
              patch("app.main.PipelineRunner") as mock_runner:
             
-            # Run agent with aic_filter = None, which should raise RuntimeError
-            with self.assertRaises(RuntimeError) as context:
-                await main_mod._run_agent(mock_transport, aic_filter=None)
-            self.assertIn("AICFilter is required to initialize AICVADAnalyzer", str(context.exception))
+            # Run agent with aic_filter = None, which should use SileroVADAnalyzer directly
+            await main_mod._run_agent(mock_transport, aic_filter=None)
+            
+            # Verify Silero VAD was passed to aggregator
+            args, kwargs = mock_agg_pair.call_args
+            user_params = kwargs.get("user_params")
+            self.assertIsInstance(user_params.vad_analyzer, main_mod.SileroVADAnalyzer)
 
     @patch("app.main._get_llm_api_key", return_value="dummy_key")
     @patch("app.main.StartupProtectedAICVADAnalyzer")
     async def test_run_agent_vad_aic(self, mock_protected_vad_class, mock_get_key):
         import app.main as main_mod
+        
+        # Manually set license key to trigger AIC path
+        main_mod.aic_license_key = "test_license"
         
         # Setup mock transport, session, and context aggregator
         mock_transport = MagicMock()
@@ -126,14 +132,15 @@ class TestAICFilterIntegration(unittest.IsolatedAsyncioTestCase):
             # Verify the StartupProtectedAICVADAnalyzer was created with correct args
             mock_protected_vad_class.assert_called_once()
             args, kwargs = mock_protected_vad_class.call_args
-            self.assertEqual(kwargs.get("speech_hold_duration"), 0.25)
+            self.assertEqual(kwargs.get("speech_hold_duration"), 0.6)
             self.assertEqual(kwargs.get("minimum_speech_duration"), 0.15)
-            self.assertEqual(kwargs.get("sensitivity"), 5.0)
+            self.assertEqual(kwargs.get("sensitivity"), 5.3)
             
-            # Verify it was passed to aggregator
+            # Verify FallbackVADAnalyzer wrapped it and was passed to aggregator
             args, kwargs = mock_agg_pair.call_args
             user_params = kwargs.get("user_params")
-            self.assertEqual(user_params.vad_analyzer, mock_protected_vad_instance)
+            self.assertIsInstance(user_params.vad_analyzer, main_mod.FallbackVADAnalyzer)
+            self.assertEqual(user_params.vad_analyzer.primary_vad, mock_protected_vad_instance)
 
 if __name__ == "__main__":
     unittest.main()

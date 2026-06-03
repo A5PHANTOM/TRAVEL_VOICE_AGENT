@@ -26,6 +26,9 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.turns.user_start import VADUserTurnStartStrategy, TranscriptionUserTurnStartStrategy
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
@@ -53,17 +56,66 @@ aic_model_id = os.environ.get("AIC_MODEL_ID", "quail-vf-2.1-l-16khz")
 
 import time
 from pipecat.audio.vad.aic_vad import AICVADAnalyzer
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams
 
 class StartupProtectedAICVADAnalyzer(AICVADAnalyzer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._start_time = time.time()
+        self._start_time = None
 
     def voice_confidence(self, buffer: bytes) -> float:
+        if self._start_time is None:
+            self._start_time = time.time()
+            logger.info("VAD audio processing started. Initializing 1.5s startup protection window.")
+
         # Ignore VAD triggers (always return 0.0) during the first 1.5 seconds of the call
         if time.time() - self._start_time < 1.5:
             return 0.0
         return super().voice_confidence(buffer)
+
+
+class FallbackVADAnalyzer(VADAnalyzer):
+    def __init__(self, primary_vad: VADAnalyzer, fallback_vad: VADAnalyzer):
+        super().__init__(params=primary_vad.params)
+        self.primary_vad = primary_vad
+        self.fallback_vad = fallback_vad
+        self.use_fallback = False
+
+    def num_frames_required(self) -> int:
+        if self.use_fallback:
+            return self.fallback_vad.num_frames_required()
+        return self.primary_vad.num_frames_required()
+
+    def set_sample_rate(self, sample_rate: int):
+        super().set_sample_rate(sample_rate)
+        self.primary_vad.set_sample_rate(sample_rate)
+        self.fallback_vad.set_sample_rate(sample_rate)
+
+    def set_params(self, params: VADParams):
+        super().set_params(params)
+        self.primary_vad.set_params(params)
+        self.fallback_vad.set_params(params)
+
+    def voice_confidence(self, buffer: bytes) -> float:
+        if not self.use_fallback:
+            try:
+                return self.primary_vad.voice_confidence(buffer)
+            except Exception as e:
+                logger.error(f"Primary VAD voice_confidence failed: {e}. Falling back to Silero VAD.")
+                self.use_fallback = True
+                self._vad_frames = self.fallback_vad.num_frames_required()
+                self._vad_frames_num_bytes = self._vad_frames * self._num_channels * 2
+
+        try:
+            return self.fallback_vad.voice_confidence(buffer)
+        except Exception as e:
+            logger.error(f"Fallback VAD voice_confidence also failed: {e}")
+            return 0.0
+
+    async def cleanup(self):
+        await self.primary_vad.cleanup()
+        await self.fallback_vad.cleanup()
 
 
 @asynccontextmanager
@@ -189,6 +241,216 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
     )
 
 
+def extract_details_from_history(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    import re
+    details = {
+        "destination": "Not specified",
+        "lead_name": "Not specified",
+        "lead_email": "Not specified",
+        "duration_days": None,
+        "accommodation": "Not specified",
+        "flight_needed": None,
+    }
+    
+    # Pre-parse: extract any email from user messages
+    email_regex = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
+    for msg in messages:
+        if msg.get("role") == "user" and msg.get("content"):
+            content = msg["content"]
+            emails = email_regex.findall(content)
+            if emails:
+                details["lead_email"] = emails[0]
+                break
+
+    def is_affirmative(reply: str) -> bool:
+        r = reply.lower().strip()
+        # Clean punctuation
+        r = re.sub(r'[^\w\s]', '', r)
+        return r in ("yes", "yeah", "yup", "correct", "that is correct", "thats correct", "yes that is correct", "yes correct", "yes please", "sure", "indeed", "that is right", "thats right", "right")
+
+    def is_negative(reply: str) -> bool:
+        r = reply.lower().strip()
+        r = re.sub(r'[^\w\s]', '', r)
+        return r in ("no", "nope", "not", "no thanks", "no thank you", "nay", "incorrect", "false")
+
+    # Let's iterate and match assistant questions with user replies
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant" and msg.get("content"):
+            assistant_text = msg["content"].strip()
+            
+            # Find the user's response right after this assistant message
+            user_reply = None
+            for j in range(i + 1, len(messages)):
+                if messages[j].get("role") == "user":
+                    user_reply = messages[j].get("content", "").strip()
+                    break
+            
+            if not user_reply:
+                continue
+                
+            assistant_text_lower = assistant_text.lower()
+            
+            # 1. Destination
+            if "destination" in assistant_text_lower or "where are you planning" in assistant_text_lower or "where to" in assistant_text_lower:
+                if not is_affirmative(user_reply) and not is_negative(user_reply):
+                    details["destination"] = user_reply
+            
+            # 2. Destination confirmation
+            match_confirm = re.search(r'^([A-Za-z\s]+),\s*is that correct\??', assistant_text, re.IGNORECASE)
+            if match_confirm and is_affirmative(user_reply):
+                details["destination"] = match_confirm.group(1).strip()
+                
+            # 3. Client Name
+            if "name" in assistant_text_lower or "speaking with" in assistant_text_lower or "speaking to" in assistant_text_lower:
+                if not is_affirmative(user_reply) and not is_negative(user_reply):
+                    cleaned_name = user_reply
+                    name_match = re.search(r'(?:my name is|i am|this is)\s+([A-Za-z\s]+)', user_reply, re.IGNORECASE)
+                    if name_match:
+                        cleaned_name = name_match.group(1).strip()
+                    details["lead_name"] = cleaned_name
+
+            # 4. Email Address
+            if "email" in assistant_text_lower:
+                emails = email_regex.findall(user_reply)
+                if emails:
+                    details["lead_email"] = emails[0]
+                elif not is_affirmative(user_reply) and not is_negative(user_reply):
+                    details["lead_email"] = user_reply
+
+            # 5. Duration
+            if "duration" in assistant_text_lower or "how many days" in assistant_text_lower or "how long" in assistant_text_lower:
+                num_match = re.search(r'\b\d+\b', user_reply)
+                if num_match:
+                    details["duration_days"] = int(num_match.group(0))
+                elif not is_affirmative(user_reply) and not is_negative(user_reply):
+                    details["duration_days"] = user_reply
+
+            # 6. Accommodation
+            if "accommodation" in assistant_text_lower or "class" in assistant_text_lower or "budget" in assistant_text_lower or "mid-range" in assistant_text_lower or "luxury" in assistant_text_lower:
+                if not is_affirmative(user_reply) and not is_negative(user_reply):
+                    details["accommodation"] = user_reply
+
+            # 7. Flight requirements
+            if "flight" in assistant_text_lower:
+                if is_affirmative(user_reply):
+                    details["flight_needed"] = True
+                elif is_negative(user_reply):
+                    details["flight_needed"] = False
+                else:
+                    details["flight_needed"] = user_reply
+
+    # Let's override details if the assistant successfully called register_interest
+    for msg in messages:
+        if msg.get("role") == "assistant" and "tool_calls" in msg:
+            for tc in msg["tool_calls"]:
+                if tc.get("type") == "function" and tc.get("function", {}).get("name") == "register_interest":
+                    try:
+                        args = json.loads(tc["function"]["arguments"])
+                        if args.get("destination"):
+                            details["destination"] = args.get("destination")
+                        if args.get("lead_name"):
+                            details["lead_name"] = args.get("lead_name")
+                        if args.get("lead_email"):
+                            details["lead_email"] = args.get("lead_email")
+                        if args.get("duration_days"):
+                            details["duration_days"] = args.get("duration_days")
+                        if args.get("accommodation"):
+                            details["accommodation"] = args.get("accommodation")
+                        if args.get("flight_needed") is not None:
+                            details["flight_needed"] = args.get("flight_needed")
+                    except Exception:
+                        pass
+
+    return details
+
+
+async def save_partial_lead_from_history(messages: list[dict[str, Any]], call_id: str | None = None) -> None:
+    # Check if register_interest was already successfully called in the history
+    for msg in messages:
+        if msg.get("role") == "tool" and msg.get("content"):
+            try:
+                res = json.loads(msg["content"])
+                if res.get("status") == "ok":
+                    logger.info("Lead was already successfully registered. Skipping partial lead save.")
+                    return
+            except Exception:
+                pass
+
+    details = extract_details_from_history(messages)
+    # Check if there is any useful information to save.
+    # At least one of destination, lead_name or lead_email must not be "Not specified"
+    if (details["destination"] == "Not specified" and 
+        details["lead_name"] == "Not specified" and 
+        details["lead_email"] == "Not specified"):
+        logger.info("No conversational details gathered yet. Skipping partial lead save.")
+        return
+        
+    destination = details["destination"]
+    lead_name = details["lead_name"]
+    # If destination is still Not specified, let's use "unknown" or "Not specified"
+    package_name = destination if destination != "Not specified" else "unknown"
+    
+    # We clean up "Not specified" to None or empty string for the saved JSON
+    record = {
+        "destination": destination if destination != "Not specified" else "unknown",
+        "package_type": None,
+        "duration_days": details.get("duration_days"),
+        "accommodation": details["accommodation"] if details["accommodation"] != "Not specified" else None,
+        "flight_needed": details.get("flight_needed"),
+        "lead_name": lead_name if lead_name != "Not specified" else None,
+        "lead_email": details["lead_email"] if details["lead_email"] != "Not specified" else None,
+        "notes": f"Partially saved from disconnect/hangup/transfer. Call ID: {call_id or 'unknown'}",
+    }
+    
+    # Check if we already have an open lead to update, or create a new one
+    from app.database import find_open_lead, update_lead, save_interest
+    
+    search_name = record["lead_name"]
+    try:
+        existing_id = await find_open_lead(package_name, search_name)
+        if existing_id:
+            logger.info(f"Updating existing partial lead {existing_id} with: {record}")
+            await update_lead(existing_id, package_name, record)
+        else:
+            logger.info(f"Saving new partial lead with: {record}")
+            await save_interest(package_name, record)
+    except Exception as e:
+        logger.error(f"Failed to save partial lead: {e}")
+
+
+class DynamicToolManager(FrameProcessor):
+    def __init__(self, context: LLMContext, register_interest_tool: Any, transfer_to_human_tool: Any):
+        super().__init__()
+        self._context = context
+        self._register_interest = register_interest_tool
+        self._transfer_to_human = transfer_to_human_tool
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        # Scan user messages for human transfer request keywords
+        user_requested = False
+        for msg in self._context.get_messages():
+            if msg.get("role") == "user" and msg.get("content"):
+                content_lower = msg["content"].lower()
+                if any(kw in content_lower for kw in [
+                    "human", "agent", "representative", "support", "supervisor", 
+                    "person", "operator", "transfer", "connect", 
+                    "speak", "talk", "someone", "somebody", "help desk", 
+                    "put me through", "customer care", "customer service"
+                ]):
+                    user_requested = True
+                    break
+        
+        # Dynamically set standard tools based on user request keywords presence
+        from pipecat.adapters.schemas.tools_schema import ToolsSchema
+        if user_requested:
+            self._context.set_tools(ToolsSchema(standard_tools=[self._register_interest, self._transfer_to_human]))
+        else:
+            self._context.set_tools(ToolsSchema(standard_tools=[self._register_interest]))
+            
+        await self.push_frame(frame, direction)
+
+
 async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_filter: Any = None):
     logger.info("Starting Travel Voice Agent")
 
@@ -199,7 +461,13 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
         )
 
     async with aiohttp.ClientSession() as session:
-        stt = DeepgramSTTService(api_key=os.environ.get("DEEPGRAM_API_KEY", ""))
+        stt = DeepgramSTTService(
+            api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
+            settings=DeepgramSTTService.Settings(
+                model="nova-2",
+                smart_format=True,
+            )
+        )
         tts = DeepgramHttpTTSService(
             api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
             settings=DeepgramHttpTTSService.Settings(
@@ -209,10 +477,11 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
         )
 
         end_session_after_speaking = False
+        lead_saved = False
 
         async def transfer_to_human(params: FunctionCallParams):
-            """Connects the caller to a human agent/supervisor. Call this immediately when the user requests to speak to a representative, support, agent, or human."""
-            nonlocal end_session_after_speaking
+            """Connects the caller to a human agent/supervisor. ONLY call this when the user explicitly and directly asks to speak to a human, representative, customer support, supervisor, or asks to transfer. Do NOT call this for regular conversation, questions, or greetings."""
+            nonlocal end_session_after_speaking, lead_saved
             logger.info(f"TRANSFER REQUESTED for Call SID: {call_id}")
             if not call_id:
                 logger.error("No active call_id available for transfer")
@@ -228,35 +497,41 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
                 await params.result_callback({"status": "failed", "message": "Twilio configuration error."})
                 return
 
-            # Extract conversation context summary from LLMContext
-            destination = "Not specified"
-            email = "Not specified"
-            name = "Not specified"
+            # Programmatic check: Ensure the user actually requested a transfer
+            user_requested = False
             for msg in context.get_messages():
-                if msg.get("role") == "assistant" and "tool_calls" in msg:
-                    for tc in msg["tool_calls"]:
-                        if tc.get("type") == "function" and tc.get("function", {}).get("name") == "register_interest":
-                            try:
-                                args = json.loads(tc["function"]["arguments"])
-                                if args.get("destination"):
-                                    destination = args.get("destination")
-                                if args.get("lead_email"):
-                                    email = args.get("lead_email")
-                                if args.get("lead_name"):
-                                    name = args.get("lead_name")
-                            except Exception:
-                                pass
+                if msg.get("role") == "user" and msg.get("content"):
+                    content_lower = msg["content"].lower()
+                    if any(kw in content_lower for kw in [
+                        "human", "agent", "representative", "support", "supervisor", 
+                        "real person", "operator", "transfer", "connect me", 
+                        "speak to", "talk to", "someone", "somebody", "help desk", 
+                        "put me through", "customer care"
+                    ]):
+                        user_requested = True
+                        break
+            
+            if not user_requested:
+                logger.warning("LLM attempted transfer_to_human, but no explicit user request was found in history. Rejecting tool call.")
+                await params.result_callback({
+                    "status": "ignored", 
+                    "message": "Transfer not allowed. The user did not explicitly request a human agent, representative, or transfer. Do NOT transfer, and instead continue the conversation or say goodbye if the booking is complete."
+                })
+                return
 
-            # Fallback to scanning messages for email if not set
-            if email == "Not specified":
-                import re
-                email_regex = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
-                for msg in context.get_messages():
-                    if msg.get("role") == "user" and msg.get("content"):
-                        matches = email_regex.findall(msg.get("content"))
-                        if matches:
-                            email = matches[0]
-                            break
+            # Save partial lead details gathered so far
+            if not lead_saved:
+                try:
+                    await save_partial_lead_from_history(context.get_messages(), call_id)
+                    lead_saved = True
+                except Exception as e:
+                    logger.error(f"Failed to save partial lead during transfer: {e}")
+
+            # Extract details for supervisor whisper
+            details = extract_details_from_history(context.get_messages())
+            destination = details.get("destination", "Not specified")
+            name = details.get("lead_name", "Not specified")
+            email = details.get("lead_email", "Not specified")
 
             summary = f"Destination: {destination}. Client Name: {name}. Email: {email}."
             logger.info(f"Generated warm transfer context: {summary}")
@@ -305,17 +580,18 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
             api_key=api_key,
             settings=GroqLLMService.Settings(
                 model="llama-3.1-8b-instant",
+                temperature=0.1,
                 system_instruction=(
                     "You are a helpful travel assistant for Lifestyle Travels. "
                     "To gather client details, you must ask questions one by one in the following strict order: "
-                    "(1) Destination, (2) Client Name, (3) Email Address, (4) Travel Duration in days, (5) Accommodation class (budget/mid-range/luxury), and (6) Flight requirements. "
+                    "(1) Destination, (2) your name (ask 'What is your name?'), (3) Email Address, (4) Travel Duration in days, (5) Accommodation class (budget/mid-range/luxury), and (6) Flight requirements. "
                     "You must ask only one question at a time. Only ask the next question after the user has answered the previous one. "
                     "Do NOT ask for multiple details at once, and do NOT skip any steps in the order. "
                     "Do NOT call `register_interest` until you have gathered all six details. "
                     "Only after you have collected all six details, call `register_interest` to register the traveler's interest. "
+                    "Once register_interest is successfully called, thank the client, inform them that an executive will reach out shortly, and conclude the conversation. "
                     "Keep responses concise, natural for text-to-speech, and limited to one short sentence or one short question at a time. "
-                    "Never display raw function-call syntax or token-like text to the user. "
-                    "If the user requests a human, customer support, representative, real person, or transfer at any point, immediately call transfer_to_human() and do not ask any more questions. After calling transfer_to_human(), say: 'Please hold while I connect you to a human agent.' "
+                    "CRITICAL: Always invoke tools natively using the function-calling API. Never write function names, JSON arguments, or XML tags (like <function> or </function>) in your conversational text responses. If you decide to call a function, only output the function call itself through the tool API, and do not include any plain text in that response. "
                     "Open the conversation with: 'Hi, I'm calling from Lifestyle Travels. Which destination are you planning to go to?'"
                 )
             ),
@@ -329,21 +605,41 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
         context = LLMContext(tools=ToolsSchema(standard_tools=[register_interest, transfer_to_human]))
         
         # Setup VAD analyzer
-        if not aic_filter:
-            raise RuntimeError("AICFilter is required to initialize AICVADAnalyzer.")
+        primary_vad = None
+        if aic_filter and aic_license_key:
+            try:
+                logger.info("Initializing primary VAD: StartupProtectedAICVADAnalyzer")
+                primary_vad = StartupProtectedAICVADAnalyzer(
+                    vad_context_factory=lambda: aic_filter.get_vad_context(),
+                    speech_hold_duration=0.6,
+                    minimum_speech_duration=0.15,
+                    sensitivity=5.3,
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize primary AIC VAD: {e}")
 
-        logger.info("Using StartupProtectedAICVADAnalyzer with AICFilter")
-        vad_analyzer = StartupProtectedAICVADAnalyzer(
-            vad_context_factory=lambda: aic_filter.get_vad_context(),
-            speech_hold_duration=0.25,
-            minimum_speech_duration=0.15,
-            sensitivity=5.0,
-        )
+        logger.info("Initializing fallback VAD: SileroVADAnalyzer")
+        fallback_vad = SileroVADAnalyzer()
+
+        if primary_vad:
+            vad_analyzer = FallbackVADAnalyzer(primary_vad, fallback_vad)
+        else:
+            logger.warning("AIC VAD not available or failed to initialize. Running with Silero VAD directly.")
+            vad_analyzer = fallback_vad
 
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context,
             user_params=LLMUserAggregatorParams(
-                vad_analyzer=vad_analyzer
+                vad_analyzer=vad_analyzer,
+                user_turn_strategies=UserTurnStrategies(
+                    start=[
+                        VADUserTurnStartStrategy(enable_interruptions=True),
+                        TranscriptionUserTurnStartStrategy(enable_interruptions=False),
+                    ],
+                    stop=[
+                        SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6),
+                    ],
+                ),
             ),
         )
 
@@ -356,11 +652,13 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
                     await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
         session_ender = SessionEnder()
+        dynamic_tool_manager = DynamicToolManager(context, register_interest, transfer_to_human)
 
         pipeline = Pipeline([
             transport.input(),
             stt,
             user_aggregator,
+            dynamic_tool_manager,
             llm,
             tts,
             session_ender,
@@ -386,7 +684,14 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
             logger.debug("Greeting frame queued")
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
-            logger.info("Client disconnected")
+            nonlocal lead_saved
+            logger.info(f"Client disconnected for call ID {call_id or 'unknown'}. Saving gathered details before cancelling.")
+            if not lead_saved:
+                try:
+                    await save_partial_lead_from_history(context.get_messages(), call_id)
+                    lead_saved = True
+                except Exception as e:
+                    logger.error(f"Error saving lead details on disconnect: {e}")
             await task.cancel()
 
         runner = PipelineRunner(handle_sigint=False)

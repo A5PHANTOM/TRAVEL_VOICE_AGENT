@@ -39,13 +39,59 @@ async def register_interest(
         notes (str | None): Any extra notes from the conversation.
     """
     destination_name = destination.strip() or "unknown"
+    if not destination_name or destination_name.lower() in ("unknown", "not specified"):
+        await params.result_callback(
+            {
+                "status": "needs_destination",
+                "message": "Please ask the client which destination they are planning to travel to.",
+            }
+        )
+        return
+
+    name = (lead_name or "").strip()
+    if not name or name.lower() in ("not specified", "unknown"):
+        await params.result_callback(
+            {
+                "status": "needs_name",
+                "message": "Please ask the client for their name.",
+            }
+        )
+        return
+
     email = (lead_email or "").strip()
-    if not email:
+    if not email or email.lower() in ("not specified", "unknown"):
         await params.result_callback(
             {
                 "status": "needs_email",
-                "destination": destination_name,
-                "message": "Please ask the client for their email address before ending the conversation or saving the booking.",
+                "message": "Please ask the client for their email address.",
+            }
+        )
+        return
+
+    if duration_days is None:
+        await params.result_callback(
+            {
+                "status": "needs_duration",
+                "message": "Please ask the client for their travel duration in days.",
+            }
+        )
+        return
+
+    accommodation_val = (accommodation or "").strip()
+    if not accommodation_val or accommodation_val.lower() in ("not specified", "unknown"):
+        await params.result_callback(
+            {
+                "status": "needs_accommodation",
+                "message": "Please ask the client for their accommodation class preference (budget, mid-range, or luxury).",
+            }
+        )
+        return
+
+    if flight_needed is None:
+        await params.result_callback(
+            {
+                "status": "needs_flight",
+                "message": "Please ask the client if they need flights included.",
             }
         )
         return
@@ -54,9 +100,9 @@ async def register_interest(
         "destination": destination_name,
         "package_type": package_type,
         "duration_days": duration_days,
-        "accommodation": accommodation,
+        "accommodation": accommodation_val,
         "flight_needed": flight_needed,
-        "lead_name": lead_name,
+        "lead_name": name,
         "lead_email": email,
         "notes": notes,
     }
