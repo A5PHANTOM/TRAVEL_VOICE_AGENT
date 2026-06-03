@@ -15,7 +15,7 @@ RUN pip install --upgrade pip
 RUN pip install -e ./pipecat[webrtc,deepgram,groq]
 
 # Additional dependencies
-RUN pip install fastapi uvicorn python-dotenv aiosqlite pipecat-ai-small-webrtc-prebuilt
+RUN pip install fastapi uvicorn python-dotenv aiosqlite pipecat-ai-small-webrtc-prebuilt aic-sdk
 
 EXPOSE 7860
 

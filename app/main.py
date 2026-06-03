@@ -13,7 +13,6 @@ from loguru import logger
 
 from pipecat_ai_small_webrtc_prebuilt.frontend import SmallWebRTCPrebuiltUI
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -43,11 +42,51 @@ from app.api import router as api_router
 
 load_dotenv(override=True)
 
+try:
+    from pipecat.audio.filters.aic_filter import AICFilter
+    AIC_FILTER_AVAILABLE = True
+except ImportError:
+    AIC_FILTER_AVAILABLE = False
+
+aic_license_key = os.environ.get("AIC_LICENSE_KEY", "")
+aic_model_id = os.environ.get("AIC_MODEL_ID", "quail-vf-2.1-l-16khz")
+
+import time
+from pipecat.audio.vad.aic_vad import AICVADAnalyzer
+
+class StartupProtectedAICVADAnalyzer(AICVADAnalyzer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._start_time = time.time()
+
+    def voice_confidence(self, buffer: bytes) -> float:
+        # Ignore VAD triggers (always return 0.0) during the first 1.5 seconds of the call
+        if time.time() - self._start_time < 1.5:
+            return 0.0
+        return super().voice_confidence(buffer)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize DB on startup
     await init_db()
+
+    # Pre-load/warm up the AIC model at startup to eliminate latency during calls
+    if aic_license_key and AIC_FILTER_AVAILABLE:
+        try:
+            logger.info(f"Pre-loading and warming up AIC model: {aic_model_id}")
+            from pipecat.audio.filters.aic_filter import AICModelManager
+            from pathlib import Path
+            model_download_dir = Path.home() / ".cache" / "pipecat" / "aic-models"
+            # Acquire once to populate the singleton cache and keep reference count >= 1
+            await AICModelManager.acquire(
+                model_id=aic_model_id,
+                model_download_dir=model_download_dir,
+            )
+            logger.info("AIC model pre-loaded successfully.")
+        except Exception as e:
+            logger.error(f"Failed to pre-load AIC model: {e}")
+
     yield
     # On shutdown disconnect any peer connections
     coros = [pc.disconnect() for pc in pcs_map.values()]
@@ -123,15 +162,34 @@ async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: B
 
 
 async def run_bot(webrtc_connection: SmallWebRTCConnection):
+    if not AIC_FILTER_AVAILABLE:
+        raise RuntimeError("AICFilter library is not available.")
+    if not aic_license_key:
+        raise RuntimeError("AIC_LICENSE_KEY is not set.")
+
+    try:
+        aic_filter = AICFilter(
+            license_key=aic_license_key,
+            model_id=aic_model_id,
+            enhancement_level=1.0,
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize AICFilter: {e}")
+        raise
+
+    params = TransportParams(audio_in_enabled=True, audio_out_enabled=True)
+    params.audio_in_filter = aic_filter
+
     await _run_agent(
         SmallWebRTCTransport(
             webrtc_connection=webrtc_connection,
-            params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
-        )
+            params=params,
+        ),
+        aic_filter=aic_filter
     )
 
 
-async def _run_agent(transport: BaseTransport, call_id: str | None = None):
+async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_filter: Any = None):
     logger.info("Starting Travel Voice Agent")
 
     api_key = _get_llm_api_key()
@@ -246,19 +304,19 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None):
         llm = GroqLLMService(
             api_key=api_key,
             settings=GroqLLMService.Settings(
+                model="llama-3.1-8b-instant",
                 system_instruction=(
-                    "You are a helpful travel assistant for ABC Travels. Detect user intent and use function calls to "
-                    "register user interest in travel packages. To gather client details, you must ask questions one by one in the following strict order: "
+                    "You are a helpful travel assistant for Lifestyle Travels. "
+                    "To gather client details, you must ask questions one by one in the following strict order: "
                     "(1) Destination, (2) Client Name, (3) Email Address, (4) Travel Duration in days, (5) Accommodation class (budget/mid-range/luxury), and (6) Flight requirements. "
-                    "Do not ask for multiple details at once. Keep responses concise, natural for TTS, and limited to one short sentence or one short question at a time. "
-                    "Never stack multiple questions in a single reply. "
-                    "Do NOT display raw function-call syntax or slash-commands. Never show tool names or token-like text to the user. "
-                    "When you need to register interest, call the registered function directly and then speak a natural follow-up. "
-                    "Before ending a booking conversation, always collect the client's email address for follow-up. "
-                    "If the email is missing, ask for it in plain language and do not close the conversation until you have it. "
-                    "If you need to ask a clarifying question, ask only one at a time in plain language. "
-                    "If the user requests a human, customer support, representative, real person, or transfer, immediately call transfer_to_human(). Do not ask follow-up questions. After calling the function, say: 'Please hold while I connect you to a human agent.' "
-                    "Open the conversation with: 'Hi ABC Travels. Which destination are you planning to go to?'"
+                    "You must ask only one question at a time. Only ask the next question after the user has answered the previous one. "
+                    "Do NOT ask for multiple details at once, and do NOT skip any steps in the order. "
+                    "Do NOT call `register_interest` until you have gathered all six details. "
+                    "Only after you have collected all six details, call `register_interest` to register the traveler's interest. "
+                    "Keep responses concise, natural for text-to-speech, and limited to one short sentence or one short question at a time. "
+                    "Never display raw function-call syntax or token-like text to the user. "
+                    "If the user requests a human, customer support, representative, real person, or transfer at any point, immediately call transfer_to_human() and do not ask any more questions. After calling transfer_to_human(), say: 'Please hold while I connect you to a human agent.' "
+                    "Open the conversation with: 'Hi, I'm calling from Lifestyle Travels. Which destination are you planning to go to?'"
                 )
             ),
         )
@@ -269,10 +327,23 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None):
 
         # Build pipeline
         context = LLMContext(tools=ToolsSchema(standard_tools=[register_interest, transfer_to_human]))
+        
+        # Setup VAD analyzer
+        if not aic_filter:
+            raise RuntimeError("AICFilter is required to initialize AICVADAnalyzer.")
+
+        logger.info("Using StartupProtectedAICVADAnalyzer with AICFilter")
+        vad_analyzer = StartupProtectedAICVADAnalyzer(
+            vad_context_factory=lambda: aic_filter.get_vad_context(),
+            speech_hold_duration=0.25,
+            minimum_speech_duration=0.15,
+            sensitivity=5.0,
+        )
+
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context,
             user_params=LLMUserAggregatorParams(
-                vad_analyzer=SileroVADAnalyzer()
+                vad_analyzer=vad_analyzer
             ),
         )
 
@@ -302,17 +373,17 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None):
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
             logger.info("Client connected")
-            # Queue greeting frame directly to TTS service
-            # This will synthesize and emit audio frames to the output transport
-            logger.debug("Queueing greeting TTSSpeakFrame to TTS")
-            await tts.queue_frame(TTSSpeakFrame("Hi, I'm calling from ABC Travels."))
-            logger.debug("Greeting frame queued")
+            # Set initial context developer instructions and assistant greeting
             context.add_message({"role": "developer", "content": "Ask one short question at a time and keep the conversation concise."})
+            context.add_message({"role": "assistant", "content": "Hi, I'm calling from Lifestyle Travels. Which destination are you planning to go to?"})
 
-            # After greeting, trigger LLM to generate opening question
-            logger.debug("Queueing LLMRunFrame to trigger opening question")
-            await llm.queue_frame(LLMRunFrame())
-            logger.debug("LLMRunFrame queued")
+            # Wait briefly to ensure the pipeline task is fully ready and started
+            await asyncio.sleep(0.2)
+
+            # Queue greeting frame directly to TTS service to start conversation instantly without LLM lag
+            logger.debug("Queueing greeting TTSSpeakFrame to TTS")
+            await tts.queue_frame(TTSSpeakFrame("Hi, I'm calling from Lifestyle Travels. Which destination are you planning to go to?"))
+            logger.debug("Greeting frame queued")
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
             logger.info("Client disconnected")
@@ -339,13 +410,29 @@ async def _run_twilio_bot(websocket: WebSocket):
         # Let the parser read the initial handshake messages and determine provider
         transport_type, call_data = await parse_telephony_websocket(websocket)
 
+        if not AIC_FILTER_AVAILABLE:
+            raise RuntimeError("AICFilter library is not available.")
+        if not aic_license_key:
+            raise RuntimeError("AIC_LICENSE_KEY is not set.")
+
+        try:
+            aic_filter = AICFilter(
+                license_key=aic_license_key,
+                model_id=aic_model_id,
+                enhancement_level=1.0,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize AICFilter: {e}")
+            raise
+
         params = FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True)
+        params.audio_in_filter = aic_filter
 
         # _create_telephony_transport will set params.serializer appropriately
         transport = await _create_telephony_transport(websocket, params, transport_type, call_data)
 
         call_id = call_data.get("call_id")
-        await _run_agent(transport, call_id=call_id)
+        await _run_agent(transport, call_id=call_id, aic_filter=aic_filter)
     except Exception as exc:
         logger.exception(f"Twilio agent error: {exc}")
 
@@ -415,7 +502,7 @@ async def twilio_whisper(request: Request):
     twiml = (
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
         "<Response>"
-        f"<Say>Incoming warm transfer from ABC Travels. Summary of conversation: {context_text}. Connecting you to the caller now.</Say>"
+        f"<Say>Incoming warm transfer from Lifestyle Travels. Summary of conversation: {context_text}. Connecting you to the caller now.</Say>"
         "</Response>"
     )
     return Response(content=twiml, media_type="application/xml")
@@ -434,10 +521,27 @@ async def exotel_media(websocket: WebSocket):
         if transport_type != "exotel":
             raise RuntimeError(f"Unexpected telephony provider for /exotel/media: {transport_type}")
 
+        if not AIC_FILTER_AVAILABLE:
+            raise RuntimeError("AICFilter library is not available.")
+        if not aic_license_key:
+            raise RuntimeError("AIC_LICENSE_KEY is not set.")
+
+        try:
+            aic_filter = AICFilter(
+                license_key=aic_license_key,
+                model_id=aic_model_id,
+                enhancement_level=1.0,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize AICFilter: {e}")
+            raise
+
         params = FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True)
+        params.audio_in_filter = aic_filter
+
         transport = await _create_telephony_transport(websocket, params, transport_type, call_data)
 
-        await _run_agent(transport)
+        await _run_agent(transport, aic_filter=aic_filter)
     except Exception as e:
         logger.exception(f"Exotel voicebot error: {e}")
 

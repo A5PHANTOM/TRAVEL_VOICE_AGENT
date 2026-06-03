@@ -15,7 +15,10 @@ services:
       - STUN_SERVER
       - PORT=7860
       - DB_PATH=/data/agents.db
+      - AIC_LICENSE_KEY
+      - AIC_MODEL_ID
     volumes:
       - ./data:/data
       - ./app:/app/app
       - ./scratch:/app/scratch
+      - ./.env:/app/.env
