@@ -84,7 +84,7 @@ class TestDatabaseAndAPI(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No conversation summary available", response_fallback.text)
 
     def test_extract_details_from_history(self):
-        from app.main import extract_details_from_history
+        from app.lead_extraction import extract_details_from_history
         
         # Test Case 1: Standard conversation flow
         messages = [
@@ -107,7 +107,7 @@ class TestDatabaseAndAPI(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(details["lead_name"], "John Doe")
         self.assertEqual(details["lead_email"], "john@example.com")
         self.assertEqual(details["duration_days"], 5)
-        self.assertEqual(details["accommodation"], "luxury please")
+        self.assertEqual(details["accommodation"], "luxury")
         self.assertEqual(details["flight_needed"], True)
         
         # Test Case 2: Confirmation pattern e.g. "Paris, is that correct?"

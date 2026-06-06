@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import json
 from contextlib import asynccontextmanager
@@ -17,7 +18,16 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.frames.frames import TTSSpeakFrame, LLMRunFrame, EndFrame, BotStoppedSpeakingFrame, Frame
+from pipecat.frames.frames import (
+    TTSSpeakFrame,
+    LLMRunFrame,
+    LLMContextFrame,
+    EndFrame,
+    BotStoppedSpeakingFrame,
+    Frame,
+    StartFrame,
+    TextFrame,
+)
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -43,6 +53,12 @@ from pipecat.services.groq.llm import GroqLLMService
 from app.functions import register_interest
 from app.database import get_leads, init_db
 from app.api import router as api_router
+from app.rag import FaissRAG
+from app.lead_extraction import (
+    build_partial_record,
+    extract_details_from_history,
+    _known_destinations,
+)
 
 load_dotenv(override=True)
 
@@ -140,6 +156,20 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to pre-load AIC model: {e}")
 
+    global _rag_store
+    try:
+        _rag_store = FaissRAG(
+            knowledge_dir=os.path.join(os.getcwd(), "knowledge"),
+            persist_dir=os.path.join(os.getcwd(), "faiss_db"),
+            chunk_size=512,
+            max_snippet_chars=250,
+        )
+        count = await asyncio.to_thread(_rag_store.ingest_knowledge)
+        logger.info(f"RAG: ingested {count} knowledge chunks into FAISS at startup")
+    except Exception as e:
+        logger.error(f"Failed to initialize RAG index at startup: {e}")
+        _rag_store = None
+
     yield
     # On shutdown disconnect any peer connections
     coros = [pc.disconnect() for pc in pcs_map.values()]
@@ -155,6 +185,26 @@ app.mount("/client", SmallWebRTCPrebuiltUI)
 # Store active peer connections
 pcs_map: dict[str, SmallWebRTCConnection] = {}
 active_sessions: dict[str, dict[str, Any]] = {}
+
+# Shared RAG index — built once at app startup from knowledge/
+_rag_store: FaissRAG | None = None
+
+RAG_MARKER = "Relevant knowledge:"
+RAG_INFO_KEYWORDS = (
+    "tell me", "more about", "information", "what to see", "attractions",
+    "places to", "visit", "visa", "package", "best time", "recommend", "suggest",
+    "how much", "cost", "things to do", "overview", "describe", "details",
+)
+RAG_FILLER_UTTERANCES = frozenset({
+    "hello", "hi", "hey", "huh", "yes", "no", "ok", "okay", "what", "pardon",
+})
+LEAKED_FUNCTION_TEXT_RE = re.compile(
+    r"function\s*=\s*register_interest|"
+    r"register_interest\s*[\{>]|"
+    r"<\s*/?\s*function|"
+    r'\{\s*"lead_name"\s*:',
+    re.IGNORECASE,
+)
 
 ice_servers = [IceServer(urls=os.environ.get("STUN_SERVER", "stun:stun.l.google.com:19302"))]
 
@@ -188,19 +238,31 @@ def _get_public_base_url(request: Request | None = None) -> str:
 
 async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: BackgroundTasks):
     pc_id = request_data.get("pc_id")
+    sdp = request_data.get("sdp")
+    offer_type = request_data.get("type")
 
     if pc_id and pc_id in pcs_map:
         pipecat_connection = pcs_map[pc_id]
-        
+
+        if not sdp:
+            # PATCH without SDP = non-offer renegotiation signal (e.g. restart_pc
+            # flag or track-status). Return the current answer so the client keeps
+            # its connection alive without crashing.
+            logger.debug(f"Renegotiation PATCH for {pc_id} has no sdp — returning current answer")
+            answer = pipecat_connection.get_answer()
+            return answer
+
         logger.info(f"Reusing existing connection for pc_id: {pc_id}")
         await pipecat_connection.renegotiate(
-            sdp=request_data["sdp"],
-            type=request_data["type"],
+            sdp=sdp,
+            type=offer_type,
             restart_pc=request_data.get("restart_pc", False),
         )
     else:
+        if not sdp:
+            raise HTTPException(status_code=400, detail="Missing sdp in offer payload")
         pipecat_connection = SmallWebRTCConnection(ice_servers)
-        await pipecat_connection.initialize(sdp=request_data["sdp"], type=request_data["type"])
+        await pipecat_connection.initialize(sdp=sdp, type=offer_type)
 
         @pipecat_connection.event_handler("closed")
         async def handle_disconnected(webrtc_connection: SmallWebRTCConnection):
@@ -242,129 +304,6 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
     )
 
 
-def extract_details_from_history(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    import re
-    details = {
-        "destination": "Not specified",
-        "lead_name": "Not specified",
-        "lead_email": "Not specified",
-        "duration_days": None,
-        "accommodation": "Not specified",
-        "flight_needed": None,
-    }
-    
-    # Pre-parse: extract any email from user messages
-    email_regex = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
-    for msg in messages:
-        if msg.get("role") == "user" and msg.get("content"):
-            content = msg["content"]
-            emails = email_regex.findall(content)
-            if emails:
-                details["lead_email"] = emails[0]
-                break
-
-    def is_affirmative(reply: str) -> bool:
-        r = reply.lower().strip()
-        # Clean punctuation
-        r = re.sub(r'[^\w\s]', '', r)
-        return r in ("yes", "yeah", "yup", "correct", "that is correct", "thats correct", "yes that is correct", "yes correct", "yes please", "sure", "indeed", "that is right", "thats right", "right")
-
-    def is_negative(reply: str) -> bool:
-        r = reply.lower().strip()
-        r = re.sub(r'[^\w\s]', '', r)
-        return r in ("no", "nope", "not", "no thanks", "no thank you", "nay", "incorrect", "false")
-
-    # Let's iterate and match assistant questions with user replies
-    for i, msg in enumerate(messages):
-        if msg.get("role") == "assistant" and msg.get("content"):
-            assistant_text = msg["content"].strip()
-            
-            # Find the user's response right after this assistant message
-            user_reply = None
-            for j in range(i + 1, len(messages)):
-                if messages[j].get("role") == "user":
-                    user_reply = messages[j].get("content", "").strip()
-                    break
-            
-            if not user_reply:
-                continue
-                
-            assistant_text_lower = assistant_text.lower()
-            
-            # 1. Destination
-            if "destination" in assistant_text_lower or "where are you planning" in assistant_text_lower or "where to" in assistant_text_lower:
-                if not is_affirmative(user_reply) and not is_negative(user_reply):
-                    details["destination"] = user_reply
-            
-            # 2. Destination confirmation
-            match_confirm = re.search(r'^([A-Za-z\s]+),\s*is that correct\??', assistant_text, re.IGNORECASE)
-            if match_confirm and is_affirmative(user_reply):
-                details["destination"] = match_confirm.group(1).strip()
-                
-            # 3. Client Name
-            if "name" in assistant_text_lower or "speaking with" in assistant_text_lower or "speaking to" in assistant_text_lower:
-                if not is_affirmative(user_reply) and not is_negative(user_reply):
-                    cleaned_name = user_reply
-                    name_match = re.search(r'(?:my name is|i am|this is)\s+([A-Za-z\s]+)', user_reply, re.IGNORECASE)
-                    if name_match:
-                        cleaned_name = name_match.group(1).strip()
-                    details["lead_name"] = cleaned_name
-
-            # 4. Email Address
-            if "email" in assistant_text_lower:
-                emails = email_regex.findall(user_reply)
-                if emails:
-                    details["lead_email"] = emails[0]
-                elif not is_affirmative(user_reply) and not is_negative(user_reply):
-                    details["lead_email"] = user_reply
-
-            # 5. Duration
-            if "duration" in assistant_text_lower or "how many days" in assistant_text_lower or "how long" in assistant_text_lower:
-                num_match = re.search(r'\b\d+\b', user_reply)
-                if num_match:
-                    details["duration_days"] = int(num_match.group(0))
-                elif not is_affirmative(user_reply) and not is_negative(user_reply):
-                    details["duration_days"] = user_reply
-
-            # 6. Accommodation
-            if "accommodation" in assistant_text_lower or "class" in assistant_text_lower or "budget" in assistant_text_lower or "mid-range" in assistant_text_lower or "luxury" in assistant_text_lower:
-                if not is_affirmative(user_reply) and not is_negative(user_reply):
-                    details["accommodation"] = user_reply
-
-            # 7. Flight requirements
-            if "flight" in assistant_text_lower:
-                if is_affirmative(user_reply):
-                    details["flight_needed"] = True
-                elif is_negative(user_reply):
-                    details["flight_needed"] = False
-                else:
-                    details["flight_needed"] = user_reply
-
-    # Let's override details if the assistant successfully called register_interest
-    for msg in messages:
-        if msg.get("role") == "assistant" and "tool_calls" in msg:
-            for tc in msg["tool_calls"]:
-                if tc.get("type") == "function" and tc.get("function", {}).get("name") == "register_interest":
-                    try:
-                        args = json.loads(tc["function"]["arguments"])
-                        if args.get("destination"):
-                            details["destination"] = args.get("destination")
-                        if args.get("lead_name"):
-                            details["lead_name"] = args.get("lead_name")
-                        if args.get("lead_email"):
-                            details["lead_email"] = args.get("lead_email")
-                        if args.get("duration_days"):
-                            details["duration_days"] = args.get("duration_days")
-                        if args.get("accommodation"):
-                            details["accommodation"] = args.get("accommodation")
-                        if args.get("flight_needed") is not None:
-                            details["flight_needed"] = args.get("flight_needed")
-                    except Exception:
-                        pass
-
-    return details
-
-
 async def save_partial_lead_from_history(messages: list[dict[str, Any]], call_id: str | None = None) -> None:
     # Check if register_interest was already successfully called in the history
     for msg in messages:
@@ -378,34 +317,14 @@ async def save_partial_lead_from_history(messages: list[dict[str, Any]], call_id
                 pass
 
     details = extract_details_from_history(messages)
-    # Check if there is any useful information to save.
-    # At least one of destination, lead_name or lead_email must not be "Not specified"
-    if (details["destination"] == "Not specified" and 
-        details["lead_name"] == "Not specified" and 
-        details["lead_email"] == "Not specified"):
-        logger.info("No conversational details gathered yet. Skipping partial lead save.")
+    record = build_partial_record(details, call_id)
+    if not record:
+        logger.info("No valid conversational details gathered yet. Skipping partial lead save.")
         return
-        
-    destination = details["destination"]
-    lead_name = details["lead_name"]
-    # If destination is still Not specified, let's use "unknown" or "Not specified"
-    package_name = destination if destination != "Not specified" else "unknown"
-    
-    # We clean up "Not specified" to None or empty string for the saved JSON
-    record = {
-        "destination": destination if destination != "Not specified" else "unknown",
-        "package_type": None,
-        "duration_days": details.get("duration_days"),
-        "accommodation": details["accommodation"] if details["accommodation"] != "Not specified" else None,
-        "flight_needed": details.get("flight_needed"),
-        "lead_name": lead_name if lead_name != "Not specified" else None,
-        "lead_email": details["lead_email"] if details["lead_email"] != "Not specified" else None,
-        "notes": f"Partially saved from disconnect/hangup/transfer. Call ID: {call_id or 'unknown'}",
-    }
-    
-    # Check if we already have an open lead to update, or create a new one
+
     from app.database import find_open_lead, update_lead, save_interest
-    
+
+    package_name = record["destination"]
     search_name = record["lead_name"]
     try:
         existing_id = await find_open_lead(package_name, search_name)
@@ -425,17 +344,19 @@ class DynamicToolManager(FrameProcessor):
         self._context = context
         self._register_interest = register_interest_tool
         self._transfer_to_human = transfer_to_human_tool
+        self._started = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
+        if isinstance(frame, StartFrame):
+            self._started = True
 
         # Skip all processing until the pipeline has been properly started.
         # pre-StartFrame frames (audio, ClientConnectedFrame, etc.) arrive
         # before the pipeline task manager is initialized and would produce
         # a flood of harmless-but-noisy "StartFrame not received yet" errors.
-        # FrameProcessor sets self.__started in its __start() which is
-        # name-mangled to _FrameProcessor__started.
-        if not getattr(self, "_FrameProcessor__started", False):
+        if not self._started:
             return
 
         # Scan user messages for human transfer request keywords
@@ -587,6 +508,7 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
                 logger.exception(f"Error calling Twilio API: {e}")
                 await params.result_callback({"status": "failed", "message": f"Exception during Twilio API call: {str(e)}"})
 
+        destination_catalog = ", ".join(d.title() for d in _known_destinations())
         llm = GroqLLMService(
             api_key=api_key,
             settings=GroqLLMService.Settings(
@@ -598,10 +520,16 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
                     "(1) Destination, (2) your name (ask 'What is your name?'), (3) Email Address, (4) Travel Duration in days, (5) Accommodation class (budget/mid-range/luxury), and (6) Flight requirements. "
                     "You must ask only one question at a time. Only ask the next question after the user has answered the previous one. "
                     "Do NOT ask for multiple details at once, and do NOT skip any steps in the order. "
+                    "Do NOT ask about booking packages, customizing trips, or other topics outside these six fields. "
+                    "Remember the destination the client already told you and do not switch to a different country unless they change it. "
+                    f"If asked what destinations are available, list: {destination_catalog}. "
                     "Do NOT call `register_interest` until you have gathered all six details. "
+                    "The email must be a valid address with an @ symbol and domain (e.g. name@example.com). If the email sounds unclear, ask the user to repeat it. "
                     "Only after you have collected all six details, call `register_interest` to register the traveler's interest. "
                     "Once register_interest is successfully called, thank the client, inform them that an executive will reach out shortly, and conclude the conversation. "
                     "Keep responses concise, natural for text-to-speech, and limited to one short sentence or one short question at a time. "
+                    "Never repeat the user's email, name, or other personal details back verbatim. Never repeat the same sentence twice. "
+                    "When the user asks about a destination, visa, package, or policy, use any 'Relevant knowledge' system messages to answer with one or two helpful facts about THEIR chosen destination, then ask the next unanswered required field. "
                     "CRITICAL: Always invoke tools natively using the function-calling API. Never write function names, JSON arguments, or XML tags (like <function> or </function>) in your conversational text responses. If you decide to call a function, only output the function call itself through the tool API, and do not include any plain text in that response. "
                     "Open the conversation with: 'Hi, I'm calling from Lifestyle Travels. Which destination are you planning to go to?'"
                 )
@@ -611,6 +539,8 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
         # Register functions
         llm.register_direct_function(register_interest)
         llm.register_direct_function(transfer_to_human)
+
+        rag = _rag_store
 
         # Build pipeline
         context = LLMContext(tools=ToolsSchema(standard_tools=[register_interest, transfer_to_human]))
@@ -666,17 +596,145 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
         session_ender = SessionEnder()
         dynamic_tool_manager = DynamicToolManager(context, register_interest, transfer_to_human)
 
-        pipeline = Pipeline([
+        # Insert a small frame processor that injects relevant knowledge snippets
+        # NOTE: FrameProcessor and FrameDirection are already imported at module level.
+        # Do NOT re-import them here — a local import shadows the module-level name
+        # and causes UnboundLocalError when SessionEnder (above) references it.
+
+        class RAGAugmenter(FrameProcessor):
+            def __init__(self, rag_client: FaissRAG, k: int = 3, min_score: float = 0.12):
+                super().__init__()
+                self.rag = rag_client
+                self.k = k
+                self.min_score = min_score
+
+            @staticmethod
+            def _build_query(messages: list[dict]) -> tuple[str | None, str | None]:
+                user_texts = [
+                    m["content"].strip()
+                    for m in messages
+                    if m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"].strip()
+                ]
+                if not user_texts:
+                    return None, None
+                last_user = user_texts[-1]
+                lower = last_user.lower()
+                # Only widen the query to recent history when the user is asking for info.
+                if any(kw in lower for kw in RAG_INFO_KEYWORDS):
+                    return last_user, " ".join(user_texts[-8:])
+                return last_user, last_user
+
+            @staticmethod
+            def _should_inject(last_user: str, top_score: float, min_score: float) -> bool:
+                normalized = re.sub(r"[^\w\s]", "", last_user.lower()).strip()
+                if normalized in RAG_FILLER_UTTERANCES or len(normalized) < 4:
+                    return False
+                lower = last_user.lower()
+                if not any(kw in lower for kw in RAG_INFO_KEYWORDS):
+                    return False
+                return top_score >= min_score
+
+            @staticmethod
+            def _scrub_leaked_assistant_text(context: LLMContext) -> None:
+                msgs = context.get_messages()
+                cleaned = [
+                    m for m in msgs
+                    if not (
+                        m.get("role") == "assistant"
+                        and isinstance(m.get("content"), str)
+                        and LEAKED_FUNCTION_TEXT_RE.search(m["content"])
+                    )
+                ]
+                if len(cleaned) != len(msgs):
+                    context.set_messages(cleaned)
+                    logger.warning("Removed leaked function-call text from assistant context")
+
+            @staticmethod
+            def _strip_old_injections(context: LLMContext) -> None:
+                msgs = context.get_messages()
+                filtered = [
+                    m for m in msgs
+                    if not (
+                        m.get("role") == "system"
+                        and isinstance(m.get("content"), str)
+                        and m["content"].startswith(RAG_MARKER)
+                    )
+                ]
+                if len(filtered) != len(msgs):
+                    context.set_messages(filtered)
+
+            async def process_frame(self, frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+
+                # User aggregator emits LLMContextFrame downstream to trigger the LLM.
+                if (
+                    direction == FrameDirection.DOWNSTREAM
+                    and isinstance(frame, LLMContextFrame)
+                    and self.rag is not None
+                ):
+                    try:
+                        context = frame.context
+                        self._scrub_leaked_assistant_text(context)
+                        last_user, query = self._build_query(context.get_messages())
+                        if last_user and query:
+                            snippets = await asyncio.to_thread(self.rag.get_relevant, query, self.k)
+                            snippets = [s for s in snippets if s.get("score", 0) >= self.min_score]
+                            if snippets and self._should_inject(last_user, snippets[0]["score"], self.min_score):
+                                self._strip_old_injections(context)
+                                builder = [RAG_MARKER]
+                                for s in snippets:
+                                    src = s.get("metadata", {}).get("source", "unknown")
+                                    doc = s.get("document", "")
+                                    builder.append(f"Source: {os.path.basename(src)}: {doc}")
+                                context.add_message({"role": "system", "content": " \n ".join(builder)})
+                                logger.info(
+                                    f"RAG: injected {len(snippets)} snippet(s) "
+                                    f"(top score {snippets[0]['score']:.2f}) for: {last_user[:80]!r}"
+                                )
+                    except Exception as e:
+                        logger.warning(f"RAGAugmenter error: {e}")
+
+                await self.push_frame(frame, direction)
+
+        rag_augmenter = RAGAugmenter(rag) if rag is not None else None
+
+        class AssistantTextSanitizer(FrameProcessor):
+            """Drop LLM text that looks like a leaked tool call before it reaches TTS."""
+
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if (
+                    direction == FrameDirection.DOWNSTREAM
+                    and isinstance(frame, TextFrame)
+                    and frame.text
+                    and LEAKED_FUNCTION_TEXT_RE.search(frame.text)
+                ):
+                    logger.warning(f"Suppressing leaked function-call text from TTS: {frame.text[:120]!r}")
+                    return
+                await self.push_frame(frame, direction)
+
+        assistant_text_sanitizer = AssistantTextSanitizer()
+
+        pipeline_components = [
             transport.input(),
             stt,
             user_aggregator,
+        ]
+
+        if rag_augmenter:
+            pipeline_components.append(rag_augmenter)
+
+        pipeline_components += [
             dynamic_tool_manager,
             llm,
+            assistant_text_sanitizer,
             tts,
             session_ender,
             transport.output(),
             assistant_aggregator,
-        ])
+        ]
+
+        pipeline = Pipeline(pipeline_components)
 
         task = PipelineTask(pipeline, params=PipelineParams(enable_metrics=True, enable_usage_metrics=True))
 
@@ -907,8 +965,21 @@ async def session_offer(session_id: str, request: Request, background_tasks: Bac
         raise HTTPException(status_code=404, detail="Invalid or not-yet-ready session_id")
 
     request_data = await request.json()
-    if "request_data" not in request_data and "requestData" not in request_data:
-        request_data["request_data"] = active_sessions[session_id]
+    logger.debug(f"session_offer [{request.method}] body keys: {list(request_data.keys())}")
+
+    # RTVI wraps the actual WebRTC offer inside a `body` or `offer` key.
+    # Unwrap it so _handle_webrtc_offer receives a dict with top-level sdp/type.
+    offer_payload = (
+        request_data.get("body")
+        or request_data.get("offer")
+        or request_data.get("requestData")
+        or request_data.get("request_data")
+    )
+    if offer_payload and isinstance(offer_payload, dict) and "sdp" in offer_payload:
+        # Merge pc_id from outer wrapper if present
+        if "pc_id" in request_data and "pc_id" not in offer_payload:
+            offer_payload["pc_id"] = request_data["pc_id"]
+        request_data = offer_payload
 
     return await _handle_webrtc_offer(request_data, background_tasks)
 

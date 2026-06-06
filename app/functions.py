@@ -23,7 +23,7 @@ def _normalize_text(value: str | None) -> str:
 def _is_placeholder_destination(value: str) -> bool:
     normalized = value.casefold().strip()
     normalized = re.sub(r"[^a-z0-9\s-]", "", normalized)
-    return normalized in {
+    if normalized in {
         "",
         "unknown",
         "not specified",
@@ -39,13 +39,27 @@ def _is_placeholder_destination(value: str) -> bool:
         "hi",
         "hello",
         "hey",
-    }
+        "lot",
+        "then",
+        "com",
+        "code",
+        "is",
+    }:
+        return True
+    if "?" in value or len(value) > 50:
+        return True
+    if any(phrase in normalized for phrase in (
+        "which location", "tell me", "can you", "what are", "hello",
+        "planning for", "all the destination",
+    )):
+        return True
+    return False
 
 
 def _is_placeholder_name(value: str) -> bool:
     normalized = value.casefold().strip()
     normalized = re.sub(r"[^a-z\s-]", "", normalized)
-    return normalized in {
+    if normalized in {
         "",
         "unknown",
         "not specified",
@@ -57,11 +71,31 @@ def _is_placeholder_name(value: str) -> bool:
         "hi",
         "hello",
         "hey",
-    }
+        "lot",
+        "com",
+        "code",
+        "is",
+        "velda number",
+        "number in velda",
+    }:
+        return True
+    if "?" in value or len(value) > 50:
+        return True
+    return False
 
 
 def _is_valid_email(value: str) -> bool:
-    return bool(re.fullmatch(r"[\w\.-]+@[\w\.-]+\.\w+", value))
+    if not re.fullmatch(r"[\w\.-]+@[\w\.-]+\.\w+", value):
+        return False
+    local, _, domain = value.partition("@")
+    if len(value) > 100 or len(local) > 64 or len(domain) > 64:
+        return False
+    # Reject common STT garbage (long runs of repeated characters or spaces).
+    if re.search(r"(.)\1{4,}", local):
+        return False
+    if local.count(" ") > 1:
+        return False
+    return True
 
 
 def _is_valid_accommodation(value: str) -> bool:
