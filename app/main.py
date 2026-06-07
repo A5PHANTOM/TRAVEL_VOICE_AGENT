@@ -46,8 +46,6 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.serializers.twilio import TwilioFrameSerializer
 
-from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.deepgram.tts import DeepgramHttpTTSService
 from pipecat.services.groq.llm import GroqLLMService
 
 from app.functions import register_interest
@@ -59,6 +57,8 @@ from app.lead_extraction import (
     extract_details_from_history,
     _known_destinations,
 )
+from app.languages import SUPPORTED_LANGUAGES, build_system_instruction, get_language_config
+from app.voice_services import create_stt_tts, resolve_voice_language
 
 load_dotenv(override=True)
 
@@ -269,14 +269,15 @@ async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: B
             logger.info(f"Discarding peer connection for pc_id: {webrtc_connection.pc_id}")
             pcs_map.pop(webrtc_connection.pc_id, None)
 
-        background_tasks.add_task(run_bot, pipecat_connection)
+        voice_language = request_data.get("voice_language") or request_data.get("language")
+        background_tasks.add_task(run_bot, pipecat_connection, voice_language)
 
     answer = pipecat_connection.get_answer()
     pcs_map[answer["pc_id"]] = pipecat_connection
     return answer
 
 
-async def run_bot(webrtc_connection: SmallWebRTCConnection):
+async def run_bot(webrtc_connection: SmallWebRTCConnection, voice_language: str | None = None):
     if not AIC_FILTER_AVAILABLE:
         raise RuntimeError("AICFilter library is not available.")
     if not aic_license_key:
@@ -300,7 +301,8 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
             webrtc_connection=webrtc_connection,
             params=params,
         ),
-        aic_filter=aic_filter
+        aic_filter=aic_filter,
+        voice_language=voice_language,
     )
 
 
@@ -383,8 +385,14 @@ class DynamicToolManager(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_filter: Any = None):
-    logger.info("Starting Travel Voice Agent")
+async def _run_agent(
+    transport: BaseTransport,
+    call_id: str | None = None,
+    aic_filter: Any = None,
+    voice_language: str | None = None,
+):
+    lang = resolve_voice_language(voice_language)
+    logger.info(f"Starting Travel Voice Agent (language={lang.code}, {lang.label})")
 
     api_key = _get_llm_api_key()
     if not api_key:
@@ -393,20 +401,7 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
         )
 
     async with aiohttp.ClientSession() as session:
-        stt = DeepgramSTTService(
-            api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
-            settings=DeepgramSTTService.Settings(
-                model="nova-2",
-                smart_format=True,
-            )
-        )
-        tts = DeepgramHttpTTSService(
-            api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
-            settings=DeepgramHttpTTSService.Settings(
-                voice="aura-2-andromeda-en",
-            ),
-            aiohttp_session=session,
-        )
+        stt, tts = create_stt_tts(lang, session)
 
         end_session_after_speaking = False
         lead_saved = False
@@ -514,25 +509,7 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
             settings=GroqLLMService.Settings(
                 model="llama-3.1-8b-instant",
                 temperature=0.1,
-                system_instruction=(
-                    "You are a helpful travel assistant for Lifestyle Travels. "
-                    "To gather client details, you must ask questions one by one in the following strict order: "
-                    "(1) Destination, (2) your name (ask 'What is your name?'), (3) Email Address, (4) Travel Duration in days, (5) Accommodation class (budget/mid-range/luxury), and (6) Flight requirements. "
-                    "You must ask only one question at a time. Only ask the next question after the user has answered the previous one. "
-                    "Do NOT ask for multiple details at once, and do NOT skip any steps in the order. "
-                    "Do NOT ask about booking packages, customizing trips, or other topics outside these six fields. "
-                    "Remember the destination the client already told you and do not switch to a different country unless they change it. "
-                    f"If asked what destinations are available, list: {destination_catalog}. "
-                    "Do NOT call `register_interest` until you have gathered all six details. "
-                    "The email must be a valid address with an @ symbol and domain (e.g. name@example.com). If the email sounds unclear, ask the user to repeat it. "
-                    "Only after you have collected all six details, call `register_interest` to register the traveler's interest. "
-                    "Once register_interest is successfully called, thank the client, inform them that an executive will reach out shortly, and conclude the conversation. "
-                    "Keep responses concise, natural for text-to-speech, and limited to one short sentence or one short question at a time. "
-                    "Never repeat the user's email, name, or other personal details back verbatim. Never repeat the same sentence twice. "
-                    "When the user asks about a destination, visa, package, or policy, use any 'Relevant knowledge' system messages to answer with one or two helpful facts about THEIR chosen destination, then ask the next unanswered required field. "
-                    "CRITICAL: Always invoke tools natively using the function-calling API. Never write function names, JSON arguments, or XML tags (like <function> or </function>) in your conversational text responses. If you decide to call a function, only output the function call itself through the tool API, and do not include any plain text in that response. "
-                    "Open the conversation with: 'Hi, I'm calling from Lifestyle Travels. Which destination are you planning to go to?'"
-                )
+                system_instruction=build_system_instruction(lang, destination_catalog),
             ),
         )
 
@@ -742,15 +719,15 @@ async def _run_agent(transport: BaseTransport, call_id: str | None = None, aic_f
         async def on_client_connected(transport, client):
             logger.info("Client connected")
             # Set initial context developer instructions and assistant greeting
-            context.add_message({"role": "developer", "content": "Ask one short question at a time and keep the conversation concise."})
-            context.add_message({"role": "assistant", "content": "Hi, I'm calling from Lifestyle Travels. Which destination are you planning to go to?"})
+            context.add_message({"role": "developer", "content": lang.developer_hint})
+            context.add_message({"role": "assistant", "content": lang.greeting})
 
             # Wait briefly to ensure the pipeline task is fully ready and started
             await asyncio.sleep(0.2)
 
             # Queue greeting frame directly to TTS service to start conversation instantly without LLM lag
             logger.debug("Queueing greeting TTSSpeakFrame to TTS")
-            await tts.queue_frame(TTSSpeakFrame("Hi, I'm calling from Lifestyle Travels. Which destination are you planning to go to?"))
+            await tts.queue_frame(TTSSpeakFrame(lang.greeting))
             logger.debug("Greeting frame queued")
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
@@ -807,7 +784,12 @@ async def _run_twilio_bot(websocket: WebSocket):
         transport = await _create_telephony_transport(websocket, params, transport_type, call_data)
 
         call_id = call_data.get("call_id")
-        await _run_agent(transport, call_id=call_id, aic_filter=aic_filter)
+        await _run_agent(
+            transport,
+            call_id=call_id,
+            aic_filter=aic_filter,
+            voice_language=os.environ.get("VOICE_LANGUAGE"),
+        )
     except Exception as exc:
         logger.exception(f"Twilio agent error: {exc}")
 
@@ -981,6 +963,11 @@ async def session_offer(session_id: str, request: Request, background_tasks: Bac
             offer_payload["pc_id"] = request_data["pc_id"]
         request_data = offer_payload
 
+    session_meta = active_sessions.get(session_id, {})
+    voice_language = session_meta.get("language") or request_data.get("language")
+    if voice_language:
+        request_data["voice_language"] = voice_language
+
     return await _handle_webrtc_offer(request_data, background_tasks)
 
 
@@ -1003,13 +990,29 @@ async def start(request: Request):
         raise HTTPException(status_code=400, detail=f"Unsupported transport '{transport}'")
 
     session_id = request_data.get("sessionId") or request_data.get("session_id") or os.urandom(8).hex()
-    active_sessions[session_id] = request_data.get("body", {})
+    session_body = dict(request_data.get("body", {}) or {})
+    if request_data.get("language"):
+        session_body["language"] = request_data["language"]
+    active_sessions[session_id] = session_body
 
     result: dict[str, Any] = {"sessionId": session_id}
     if request_data.get("enableDefaultIceServers"):
         result["iceConfig"] = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
     return result
+
+
+@app.get("/api/languages")
+async def api_languages():
+    """Supported voice languages and active default."""
+    default = get_language_config(os.environ.get("VOICE_LANGUAGE"))
+    return {
+        "default": default.code,
+        "languages": [
+            {"code": code, "label": label, "provider": "sarvam" if code != "en" else "deepgram"}
+            for code, label in SUPPORTED_LANGUAGES.items()
+        ],
+    }
 
 
 @app.get("/report")

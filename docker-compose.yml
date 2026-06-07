@@ -5,6 +5,8 @@ services:
       - "7860:7860"
     environment:
       - DEEPGRAM_API_KEY
+      - SARVAM_API_KEY
+      - VOICE_LANGUAGE
       - GROQ_API_KEY
       - OPENAI_API_KEY
       - OPENAI_ADMIN_KEY
