@@ -27,6 +27,8 @@ from pipecat.frames.frames import (
     Frame,
     StartFrame,
     TextFrame,
+    TranscriptionFrame,
+    TTSUpdateSettingsFrame,
 )
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
@@ -57,7 +59,12 @@ from app.lead_extraction import (
     extract_details_from_history,
     _known_destinations,
 )
-from app.languages import SUPPORTED_LANGUAGES, build_system_instruction, get_language_config
+from app.languages import (
+    SUPPORTED_LANGUAGES,
+    VoiceLanguageConfig,
+    build_system_instruction,
+    get_language_config,
+)
 from app.voice_services import create_stt_tts, resolve_voice_language
 
 load_dotenv(override=True)
@@ -385,14 +392,65 @@ class DynamicToolManager(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class LanguageSwitcher(FrameProcessor):
+    def __init__(
+        self,
+        context: LLMContext,
+        tts: Any,
+        session: aiohttp.ClientSession,
+        destination_catalog: str,
+        initial_lang: VoiceLanguageConfig,
+    ):
+        super().__init__()
+        self._context = context
+        self._tts = tts
+        self._session = session
+        self._destination_catalog = destination_catalog
+        self._current_lang = initial_lang
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if direction == FrameDirection.UPSTREAM and isinstance(frame, TranscriptionFrame):
+            detected_lang_code = frame.language
+            if detected_lang_code:
+                # Normalize language code to what our system expects (en, hi, ml)
+                from app.languages import normalize_language_code
+                resolved_code = normalize_language_code(detected_lang_code)
+
+                if resolved_code != self._current_lang.code:
+                    logger.info(f"Language switch detected: {self._current_lang.code} -> {resolved_code}")
+                    new_lang = get_language_config(resolved_code)
+                    
+                    # 1. Update LLM context with new system instructions
+                    new_instructions = build_system_instruction(new_lang, self._destination_catalog)
+                    
+                    # Update system message in context
+                    # For simplicity, we add a new system message that overrides previous ones
+                    self._context.add_message({
+                        "role": "system", 
+                        "content": f"The user is now speaking {new_lang.label}. {new_instructions}"
+                    })
+
+                    # 2. Update TTS service language if it's a MultilingualTTS
+                    if hasattr(self._tts, "set_language"):
+                        self._tts.set_language(resolved_code)
+                    
+                    self._current_lang = new_lang
+
+        await self.push_frame(frame, direction)
+
+
 async def _run_agent(
     transport: BaseTransport,
     call_id: str | None = None,
     aic_filter: Any = None,
     voice_language: str | None = None,
 ):
+    # Use multilingual mode by default if no specific language is requested, or if we want smart switching
+    multilingual = True if voice_language is None else False
     lang = resolve_voice_language(voice_language)
-    logger.info(f"Starting Travel Voice Agent (language={lang.code}, {lang.label})")
+    logger.info(f"Starting Travel Voice Agent (language={lang.code}, {lang.label}, multilingual={multilingual})")
 
     api_key = _get_llm_api_key()
     if not api_key:
@@ -401,7 +459,7 @@ async def _run_agent(
         )
 
     async with aiohttp.ClientSession() as session:
-        stt, tts = create_stt_tts(lang, session)
+        stt, tts = create_stt_tts(lang, session, multilingual=multilingual)
 
         end_session_after_speaking = False
         lead_saved = False
@@ -572,6 +630,7 @@ async def _run_agent(
 
         session_ender = SessionEnder()
         dynamic_tool_manager = DynamicToolManager(context, register_interest, transfer_to_human)
+        language_switcher = LanguageSwitcher(context, tts, session, destination_catalog, lang)
 
         # Insert a small frame processor that injects relevant knowledge snippets
         # NOTE: FrameProcessor and FrameDirection are already imported at module level.
@@ -695,6 +754,7 @@ async def _run_agent(
         pipeline_components = [
             transport.input(),
             stt,
+            language_switcher,
             user_aggregator,
         ]
 
@@ -720,14 +780,23 @@ async def _run_agent(
             logger.info("Client connected")
             # Set initial context developer instructions and assistant greeting
             context.add_message({"role": "developer", "content": lang.developer_hint})
-            context.add_message({"role": "assistant", "content": lang.greeting})
+            
+            # For multilingual mode, we might want a special multi-language greeting
+            if multilingual:
+                greeting = "Hi, I'm from Lifestyle Travels. How can I help you today? (English/Hindi/Malayalam)"
+                # Update language config for the greeting if needed, but for now we use a generic one
+            else:
+                greeting = lang.greeting
+
+            context.add_message({"role": "assistant", "content": greeting})
 
             # Wait briefly to ensure the pipeline task is fully ready and started
             await asyncio.sleep(0.2)
 
             # Queue greeting frame directly to TTS service to start conversation instantly without LLM lag
             logger.debug("Queueing greeting TTSSpeakFrame to TTS")
-            await tts.queue_frame(TTSSpeakFrame(lang.greeting))
+            await tts.queue_frame(TTSSpeakFrame(greeting))
+
             logger.debug("Greeting frame queued")
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
