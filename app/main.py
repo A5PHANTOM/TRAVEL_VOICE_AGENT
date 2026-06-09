@@ -247,6 +247,7 @@ async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: B
     pc_id = request_data.get("pc_id")
     sdp = request_data.get("sdp")
     offer_type = request_data.get("type")
+    session_id = request_data.get("session_id")
 
     if pc_id and pc_id in pcs_map:
         pipecat_connection = pcs_map[pc_id]
@@ -268,8 +269,30 @@ async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: B
     else:
         if not sdp:
             raise HTTPException(status_code=400, detail="Missing sdp in offer payload")
+
+        # Clean up any existing connection for the same session_id before creating a new one
+        if session_id:
+            for old_pc_id, conn in list(pcs_map.items()):
+                if getattr(conn, "_session_id", None) == session_id:
+                    logger.info(f"Closing and removing old connection {old_pc_id} for session {session_id} on new connection request")
+                    pcs_map.pop(old_pc_id, None)
+                    try:
+                        await conn.disconnect()
+                    except Exception as e:
+                        logger.error(f"Error disconnecting old connection: {e}")
+
         pipecat_connection = SmallWebRTCConnection(ice_servers)
-        await pipecat_connection.initialize(sdp=sdp, type=offer_type)
+        if session_id:
+            pipecat_connection._session_id = session_id
+        
+        # Save to pcs_map immediately so concurrent requests can find and terminate it
+        pcs_map[pipecat_connection.pc_id] = pipecat_connection
+
+        try:
+            await pipecat_connection.initialize(sdp=sdp, type=offer_type)
+        except Exception as e:
+            pcs_map.pop(pipecat_connection.pc_id, None)
+            raise
 
         @pipecat_connection.event_handler("closed")
         async def handle_disconnected(webrtc_connection: SmallWebRTCConnection):
@@ -428,7 +451,18 @@ class LanguageSwitcher(FrameProcessor):
                     new_instructions = build_system_instruction(new_lang, self._destination_catalog)
                     
                     # Update system message in context
-                    # For simplicity, we add a new system message that overrides previous ones
+                    # First, filter out any previous system messages from language switches
+                    msgs = self._context.get_messages()
+                    filtered_msgs = [
+                        m for m in msgs
+                        if not (
+                            m.get("role") == "system"
+                            and isinstance(m.get("content"), str)
+                            and m["content"].startswith("The user is now speaking")
+                        )
+                    ]
+                    self._context.set_messages(filtered_msgs)
+
                     self._context.add_message({
                         "role": "system", 
                         "content": f"The user is now speaking {new_lang.label}. {new_instructions}"
@@ -575,7 +609,7 @@ async def _run_agent(
         llm = GroqLLMService(
             api_key=api_key,
             settings=GroqLLMService.Settings(
-                model="llama-3.1-8b-instant",
+                model="llama-3.3-70b-versatile",
                 temperature=0.7,
                 extra={"frequency_penalty": 0.5, "presence_penalty": 0.5},
                 system_instruction=build_system_instruction(lang, destination_catalog, initial_greeting) + 
@@ -607,7 +641,7 @@ async def _run_agent(
                 logger.error(f"Failed to initialize primary AIC VAD: {e}")
 
         logger.info("Initializing fallback VAD: SileroVADAnalyzer")
-        fallback_vad = SileroVADAnalyzer()
+        fallback_vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, confidence=0.5))
 
         logger.info("Running with Silero VAD directly.")
         vad_analyzer = fallback_vad
@@ -746,16 +780,35 @@ async def _run_agent(
         class AssistantTextSanitizer(FrameProcessor):
             """Drop LLM text that looks like a leaked tool call before it reaches TTS."""
 
+            def __init__(self):
+                super().__init__()
+                self._suppress = False
+                self._seen_text = False
+
             async def process_frame(self, frame: Frame, direction: FrameDirection):
+                if direction == FrameDirection.DOWNSTREAM:
+                    if isinstance(frame, LLMRunFrame):
+                        self._suppress = False
+                        self._seen_text = False
+                    elif isinstance(frame, TextFrame) and frame.text:
+                        text = frame.text.strip()
+                        if text:
+                            if not self._seen_text:
+                                self._seen_text = True
+                                if (
+                                    text.startswith("<")
+                                    or text.startswith("{")
+                                    or "function=" in text
+                                    or "register_interest" in text
+                                    or LEAKED_FUNCTION_TEXT_RE.search(text)
+                                ):
+                                    logger.warning(f"Suppressing leaked tool call stream starting with: {text!r}")
+                                    self._suppress = True
+                            
+                            if self._suppress:
+                                return
+
                 await super().process_frame(frame, direction)
-                if (
-                    direction == FrameDirection.DOWNSTREAM
-                    and isinstance(frame, TextFrame)
-                    and frame.text
-                    and LEAKED_FUNCTION_TEXT_RE.search(frame.text)
-                ):
-                    logger.warning(f"Suppressing leaked function-call text from TTS: {frame.text[:120]!r}")
-                    return
                 await self.push_frame(frame, direction)
 
         assistant_text_sanitizer = AssistantTextSanitizer()
@@ -1043,11 +1096,29 @@ async def session_offer(session_id: str, request: Request, background_tasks: Bac
         request_data = offer_payload
 
     session_meta = active_sessions.get(session_id, {})
+    existing_pc_id = session_meta.get("pc_id")
+
+    if request.method == "POST":
+        existing_pc_id = None
+        session_meta.pop("pc_id", None)
+
+    if existing_pc_id:
+        logger.info(f"Mapping session {session_id} to existing connection {existing_pc_id}")
+        request_data["pc_id"] = existing_pc_id
+
+    request_data["session_id"] = session_id
+
     voice_language = session_meta.get("language") or request_data.get("language")
     if voice_language:
         request_data["voice_language"] = voice_language
 
-    return await _handle_webrtc_offer(request_data, background_tasks)
+    answer = await _handle_webrtc_offer(request_data, background_tasks)
+    
+    if answer and "pc_id" in answer and not existing_pc_id:
+        session_meta["pc_id"] = answer["pc_id"]
+        logger.info(f"Associated session {session_id} with connection {answer['pc_id']}")
+
+    return answer
 
 
 @app.post("/start")
