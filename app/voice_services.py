@@ -14,7 +14,7 @@ from pipecat.services.deepgram.tts import DeepgramHttpTTSService
 from app.languages import VoiceLanguageConfig, get_language_config, VoiceLanguageCode
 
 from pipecat.services.tts_service import TTSService
-from pipecat.frames.frames import TextFrame, Frame
+from pipecat.frames.frames import TextFrame, Frame, TTSSpeakFrame, SystemFrame, ControlFrame
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 
 class MultilingualTTS(FrameProcessor):
@@ -32,7 +32,15 @@ class MultilingualTTS(FrameProcessor):
             logger.warning(f"MultilingualTTS: language {lang_code} not supported, keeping {self._current_lang}")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        if isinstance(frame, TextFrame) and direction == FrameDirection.DOWNSTREAM:
+        await super().process_frame(frame, direction)
+
+        # Forward system/control frames to all sub-services so they stay in sync
+        # (e.g. StartFrame to start their tasks, CancelFrame to stop them, etc.)
+        if isinstance(frame, (SystemFrame, ControlFrame)):
+            for service in self._services.values():
+                await service.queue_frame(frame, direction)
+
+        if isinstance(frame, (TextFrame, TTSSpeakFrame)) and direction == FrameDirection.DOWNSTREAM:
             service = self._services.get(self._current_lang)
             if service:
                 # Forward to the active TTS service's queue_frame
@@ -75,7 +83,6 @@ def create_stt_tts(
                 model="nova-2",
                 smart_format=True,
                 language=None,  # Auto-detection
-                detect_language=True,
             ),
         )
 
@@ -101,10 +108,10 @@ def create_stt_tts(
         logger.info(f"Using Sarvam AI STT for {lang.label} ({lang.code})")
         stt = SarvamSTTService(
             api_key=api_key,
+            mode="transcribe",
             settings=SarvamSTTService.Settings(
                 model="saaras:v3",
                 language=lang.pipecat_language,
-                mode="transcribe",
             ),
         )
     else:
@@ -134,7 +141,7 @@ def create_tts_service(lang: VoiceLanguageConfig, session: aiohttp.ClientSession
             settings=SarvamHttpTTSService.Settings(
                 model="bulbul:v3",
                 language=lang.pipecat_language,
-                speaker=_default_sarvam_speaker(lang.code),
+                voice=_default_sarvam_speaker(lang.code),
             ),
         )
     

@@ -411,7 +411,7 @@ class LanguageSwitcher(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if direction == FrameDirection.UPSTREAM and isinstance(frame, TranscriptionFrame):
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame):
             detected_lang_code = frame.language
             if detected_lang_code:
                 # Normalize language code to what our system expects (en, hi, ml)
@@ -463,6 +463,7 @@ async def _run_agent(
 
         end_session_after_speaking = False
         lead_saved = False
+        greeting_sent = False
 
         async def transfer_to_human(params: FunctionCallParams):
             """Connects the caller to a human agent/supervisor. ONLY call this when the user explicitly and directly asks to speak to a human, representative, customer support, supervisor, or asks to transfer. Do NOT call this for regular conversation, questions, or greetings."""
@@ -566,8 +567,10 @@ async def _run_agent(
             api_key=api_key,
             settings=GroqLLMService.Settings(
                 model="llama-3.1-8b-instant",
-                temperature=0.1,
-                system_instruction=build_system_instruction(lang, destination_catalog),
+                temperature=0.7,
+                extra={"frequency_penalty": 0.5, "presence_penalty": 0.5},
+                system_instruction=build_system_instruction(lang, destination_catalog) + 
+                " IMPORTANT: Be natural and brief. Never repeat yourself or the same sentence twice in a row. If the user repeats themselves, acknowledge it naturally and move to the next question. Do NOT restart the greeting if the conversation is already underway.",
             ),
         )
 
@@ -614,7 +617,7 @@ async def _run_agent(
                         TranscriptionUserTurnStartStrategy(enable_interruptions=False),
                     ],
                     stop=[
-                        SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6),
+                        SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.8),
                     ],
                 ),
             ),
@@ -777,6 +780,11 @@ async def _run_agent(
 
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
+            nonlocal greeting_sent
+            if greeting_sent:
+                logger.info("on_client_connected fired again, skipping redundant greeting")
+                return
+
             logger.info("Client connected")
             # Set initial context developer instructions and assistant greeting
             context.add_message({"role": "developer", "content": lang.developer_hint})
@@ -791,11 +799,13 @@ async def _run_agent(
             context.add_message({"role": "assistant", "content": greeting})
 
             # Wait briefly to ensure the pipeline task is fully ready and started
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.5)
 
             # Queue greeting frame directly to TTS service to start conversation instantly without LLM lag
             logger.debug("Queueing greeting TTSSpeakFrame to TTS")
             await tts.queue_frame(TTSSpeakFrame(greeting))
+            greeting_sent = True
+
 
             logger.debug("Greeting frame queued")
         @transport.event_handler("on_client_disconnected")
