@@ -396,6 +396,7 @@ class LanguageSwitcher(FrameProcessor):
     def __init__(
         self,
         context: LLMContext,
+        stt: Any,
         tts: Any,
         session: aiohttp.ClientSession,
         destination_catalog: str,
@@ -403,6 +404,7 @@ class LanguageSwitcher(FrameProcessor):
     ):
         super().__init__()
         self._context = context
+        self._stt = stt
         self._tts = tts
         self._session = session
         self._destination_catalog = destination_catalog
@@ -435,6 +437,10 @@ class LanguageSwitcher(FrameProcessor):
                     # 2. Update TTS service language if it's a MultilingualTTS
                     if hasattr(self._tts, "set_language"):
                         self._tts.set_language(resolved_code)
+
+                    # 3. Update STT service language if it's a MultilingualSTTRouter
+                    if hasattr(self._stt, "set_language"):
+                        self._stt.set_language(resolved_code)
                     
                     self._current_lang = new_lang
 
@@ -562,6 +568,9 @@ async def _run_agent(
                 logger.exception(f"Error calling Twilio API: {e}")
                 await params.result_callback({"status": "failed", "message": f"Exception during Twilio API call: {str(e)}"})
 
+        # Determine initial greeting based on mode
+        initial_greeting = lang.greeting
+
         destination_catalog = ", ".join(d.title() for d in _known_destinations())
         llm = GroqLLMService(
             api_key=api_key,
@@ -569,7 +578,7 @@ async def _run_agent(
                 model="llama-3.1-8b-instant",
                 temperature=0.7,
                 extra={"frequency_penalty": 0.5, "presence_penalty": 0.5},
-                system_instruction=build_system_instruction(lang, destination_catalog) + 
+                system_instruction=build_system_instruction(lang, destination_catalog, initial_greeting) + 
                 " IMPORTANT: Be natural and brief. Never repeat yourself or the same sentence twice in a row. If the user repeats themselves, acknowledge it naturally and move to the next question. Do NOT restart the greeting if the conversation is already underway.",
             ),
         )
@@ -600,11 +609,8 @@ async def _run_agent(
         logger.info("Initializing fallback VAD: SileroVADAnalyzer")
         fallback_vad = SileroVADAnalyzer()
 
-        if primary_vad:
-            vad_analyzer = FallbackVADAnalyzer(primary_vad, fallback_vad)
-        else:
-            logger.warning("AIC VAD not available or failed to initialize. Running with Silero VAD directly.")
-            vad_analyzer = fallback_vad
+        logger.info("Running with Silero VAD directly.")
+        vad_analyzer = fallback_vad
 
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context,
@@ -633,7 +639,7 @@ async def _run_agent(
 
         session_ender = SessionEnder()
         dynamic_tool_manager = DynamicToolManager(context, register_interest, transfer_to_human)
-        language_switcher = LanguageSwitcher(context, tts, session, destination_catalog, lang)
+        language_switcher = LanguageSwitcher(context, stt, tts, session, destination_catalog, lang)
 
         # Insert a small frame processor that injects relevant knowledge snippets
         # NOTE: FrameProcessor and FrameDirection are already imported at module level.
@@ -789,12 +795,7 @@ async def _run_agent(
             # Set initial context developer instructions and assistant greeting
             context.add_message({"role": "developer", "content": lang.developer_hint})
             
-            # For multilingual mode, we might want a special multi-language greeting
-            if multilingual:
-                greeting = "Hi, I'm from Lifestyle Travels. How can I help you today? (English/Hindi/Malayalam)"
-                # Update language config for the greeting if needed, but for now we use a generic one
-            else:
-                greeting = lang.greeting
+            greeting = initial_greeting
 
             context.add_message({"role": "assistant", "content": greeting})
 
@@ -805,7 +806,6 @@ async def _run_agent(
             logger.debug("Queueing greeting TTSSpeakFrame to TTS")
             await tts.queue_frame(TTSSpeakFrame(greeting))
             greeting_sent = True
-
 
             logger.debug("Greeting frame queued")
         @transport.event_handler("on_client_disconnected")

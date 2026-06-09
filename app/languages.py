@@ -80,15 +80,15 @@ def get_language_config(code: str | None) -> VoiceLanguageConfig:
     return VoiceLanguageConfig(
         code="en",
         label="English",
-        pipecat_language=None,
+        pipecat_language=Language.EN_IN,
         greeting="Hi, I'm calling from Lifestyle Travels. Which destination are you planning to go to?",
         developer_hint="Ask one short question at a time and keep the conversation concise.",
         llm_language_rule="Always respond in English.",
-        uses_sarvam=False,
+        uses_sarvam=True,
     )
 
 
-def build_system_instruction(lang: VoiceLanguageConfig, destination_catalog: str) -> str:
+def build_system_instruction(lang: VoiceLanguageConfig, destination_catalog: str, greeting: str | None = None) -> str:
     base = (
         "You are a helpful travel assistant for Lifestyle Travels. "
         f"{lang.llm_language_rule} "
@@ -112,6 +112,7 @@ def build_system_instruction(lang: VoiceLanguageConfig, destination_catalog: str
         "to answer with one or two helpful facts about THEIR chosen destination, then ask the next unanswered required field. "
         "CRITICAL: Always invoke tools natively using the function-calling API. Never write function names, JSON arguments, "
         "or XML tags in your conversational text responses. "
-        f"Open the conversation with: '{lang.greeting}'"
+        f"Open the conversation with: '{greeting if greeting is not None else lang.greeting}'. "
+        "If the conversation is already underway, do NOT say the greeting again; instead, acknowledge the user's response in their language and ask the next question."
     )
     return base
