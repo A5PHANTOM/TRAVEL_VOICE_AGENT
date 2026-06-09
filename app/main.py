@@ -192,6 +192,7 @@ app.mount("/client", SmallWebRTCPrebuiltUI)
 # Store active peer connections
 pcs_map: dict[str, SmallWebRTCConnection] = {}
 active_sessions: dict[str, dict[str, Any]] = {}
+active_tasks: dict[str, asyncio.Task] = {}
 
 # Shared RAG index — built once at app startup from knowledge/
 _rag_store: FaissRAG | None = None
@@ -270,16 +271,20 @@ async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: B
         if not sdp:
             raise HTTPException(status_code=400, detail="Missing sdp in offer payload")
 
-        # Clean up any existing connection for the same session_id before creating a new one
-        if session_id:
-            for old_pc_id, conn in list(pcs_map.items()):
-                if getattr(conn, "_session_id", None) == session_id:
-                    logger.info(f"Closing and removing old connection {old_pc_id} for session {session_id} on new connection request")
-                    pcs_map.pop(old_pc_id, None)
-                    try:
-                        await conn.disconnect()
-                    except Exception as e:
-                        logger.error(f"Error disconnecting old connection: {e}")
+        # Clean up ALL existing connections in pcs_map before creating a new one
+        for old_pc_id, conn in list(pcs_map.items()):
+            logger.info(f"Closing and removing old connection {old_pc_id} on new connection request")
+            pcs_map.pop(old_pc_id, None)
+            try:
+                await conn.disconnect()
+            except Exception as e:
+                logger.error(f"Error disconnecting old connection: {e}")
+
+            # Cancel the associated bot task!
+            if old_pc_id in active_tasks:
+                logger.info(f"Cancelling bot task for old connection {old_pc_id}")
+                task = active_tasks.pop(old_pc_id)
+                task.cancel()
 
         pipecat_connection = SmallWebRTCConnection(ice_servers)
         if session_id:
@@ -294,13 +299,28 @@ async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: B
             pcs_map.pop(pipecat_connection.pc_id, None)
             raise
 
+        # Check if this connection was discarded/replaced while we were initializing!
+        if pipecat_connection.pc_id not in pcs_map:
+            logger.warning(f"Connection {pipecat_connection.pc_id} was discarded during initialization. Not starting bot.")
+            try:
+                await pipecat_connection.disconnect()
+            except Exception:
+                pass
+            raise HTTPException(status_code=409, detail="Connection was replaced during initialization")
+
         @pipecat_connection.event_handler("closed")
         async def handle_disconnected(webrtc_connection: SmallWebRTCConnection):
             logger.info(f"Discarding peer connection for pc_id: {webrtc_connection.pc_id}")
             pcs_map.pop(webrtc_connection.pc_id, None)
+            # Cancel the associated bot task when the connection is closed
+            if webrtc_connection.pc_id in active_tasks:
+                logger.info(f"Cancelling bot task on connection close event for {webrtc_connection.pc_id}")
+                task = active_tasks.pop(webrtc_connection.pc_id)
+                task.cancel()
 
         voice_language = request_data.get("voice_language") or request_data.get("language")
-        background_tasks.add_task(run_bot, pipecat_connection, voice_language)
+        task = asyncio.create_task(run_bot(pipecat_connection, voice_language))
+        active_tasks[pipecat_connection.pc_id] = task
 
     answer = pipecat_connection.get_answer()
     pcs_map[answer["pc_id"]] = pipecat_connection
@@ -308,32 +328,35 @@ async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: B
 
 
 async def run_bot(webrtc_connection: SmallWebRTCConnection, voice_language: str | None = None):
-    if not AIC_FILTER_AVAILABLE:
-        raise RuntimeError("AICFilter library is not available.")
-    if not aic_license_key:
-        raise RuntimeError("AIC_LICENSE_KEY is not set.")
-
     try:
-        aic_filter = AICFilter(
-            license_key=aic_license_key,
-            model_id=aic_model_id,
-            enhancement_level=1.0,
+        if not AIC_FILTER_AVAILABLE:
+            raise RuntimeError("AICFilter library is not available.")
+        if not aic_license_key:
+            raise RuntimeError("AIC_LICENSE_KEY is not set.")
+
+        try:
+            aic_filter = AICFilter(
+                license_key=aic_license_key,
+                model_id=aic_model_id,
+                enhancement_level=1.0,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize AICFilter: {e}")
+            raise
+
+        params = TransportParams(audio_in_enabled=True, audio_out_enabled=True)
+        params.audio_in_filter = aic_filter
+
+        await _run_agent(
+            SmallWebRTCTransport(
+                webrtc_connection=webrtc_connection,
+                params=params,
+            ),
+            aic_filter=aic_filter,
+            voice_language=voice_language,
         )
-    except Exception as e:
-        logger.error(f"Failed to initialize AICFilter: {e}")
-        raise
-
-    params = TransportParams(audio_in_enabled=True, audio_out_enabled=True)
-    params.audio_in_filter = aic_filter
-
-    await _run_agent(
-        SmallWebRTCTransport(
-            webrtc_connection=webrtc_connection,
-            params=params,
-        ),
-        aic_filter=aic_filter,
-        voice_language=voice_language,
-    )
+    finally:
+        active_tasks.pop(webrtc_connection.pc_id, None)
 
 
 async def save_partial_lead_from_history(messages: list[dict[str, Any]], call_id: str | None = None) -> None:
@@ -839,28 +862,23 @@ async def _run_agent(
 
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
-            nonlocal greeting_sent
-            if greeting_sent:
-                logger.info("on_client_connected fired again, skipping redundant greeting")
-                return
-
             logger.info("Client connected")
             # Set initial context developer instructions and assistant greeting
-            context.add_message({"role": "developer", "content": lang.developer_hint})
-            
-            greeting = initial_greeting
+            if not greeting_sent:
+                context.add_message({"role": "developer", "content": lang.developer_hint})
+                context.add_message({"role": "assistant", "content": initial_greeting})
 
-            context.add_message({"role": "assistant", "content": greeting})
+        @task.event_handler("on_pipeline_started")
+        async def on_pipeline_started(task, frame):
+            nonlocal greeting_sent
+            if greeting_sent:
+                logger.info("on_pipeline_started fired but greeting already sent")
+                return
 
-            # Wait briefly to ensure the pipeline task is fully ready and started
-            await asyncio.sleep(0.5)
-
-            # Queue greeting frame directly to TTS service to start conversation instantly without LLM lag
-            logger.debug("Queueing greeting TTSSpeakFrame to TTS")
-            await tts.queue_frame(TTSSpeakFrame(greeting))
+            logger.info("Pipeline started. Queueing greeting TTSSpeakFrame to TTS.")
+            await tts.queue_frame(TTSSpeakFrame(initial_greeting))
             greeting_sent = True
 
-            logger.debug("Greeting frame queued")
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
             nonlocal lead_saved
