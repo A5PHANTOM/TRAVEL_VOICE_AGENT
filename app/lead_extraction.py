@@ -330,7 +330,7 @@ def build_partial_record(details: dict[str, Any], call_id: str | None) -> dict[s
     if not destination and not (name and email):
         return None
 
-    return {
+    record = {
         "destination": destination or "unknown",
         "package_type": None,
         "duration_days": duration,
@@ -340,3 +340,7 @@ def build_partial_record(details: dict[str, Any], call_id: str | None) -> dict[s
         "lead_email": email,
         "notes": f"Partially saved from disconnect/hangup/transfer. Call ID: {call_id or 'unknown'}",
     }
+    out_num = os.environ.get("outgoing_number") or os.environ.get("OUTGOING_NUMBER")
+    if out_num:
+        record["outgoing_number"] = out_num.strip()
+    return record

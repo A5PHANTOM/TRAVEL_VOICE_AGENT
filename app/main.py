@@ -29,6 +29,8 @@ from pipecat.frames.frames import (
     TextFrame,
     TranscriptionFrame,
     TTSUpdateSettingsFrame,
+    SystemFrame,
+    ControlFrame,
 )
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
@@ -271,20 +273,22 @@ async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: B
         if not sdp:
             raise HTTPException(status_code=400, detail="Missing sdp in offer payload")
 
-        # Clean up ALL existing connections in pcs_map before creating a new one
-        for old_pc_id, conn in list(pcs_map.items()):
-            logger.info(f"Closing and removing old connection {old_pc_id} on new connection request")
-            pcs_map.pop(old_pc_id, None)
-            try:
-                await conn.disconnect()
-            except Exception as e:
-                logger.error(f"Error disconnecting old connection: {e}")
+        # Clean up any existing connection for the same session_id before creating a new one
+        if session_id:
+            for old_pc_id, conn in list(pcs_map.items()):
+                if getattr(conn, "_session_id", None) == session_id:
+                    logger.info(f"Closing and removing old connection {old_pc_id} for session {session_id} on new connection request")
+                    pcs_map.pop(old_pc_id, None)
+                    try:
+                        await conn.disconnect()
+                    except Exception as e:
+                        logger.error(f"Error disconnecting old connection: {e}")
 
-            # Cancel the associated bot task!
-            if old_pc_id in active_tasks:
-                logger.info(f"Cancelling bot task for old connection {old_pc_id}")
-                task = active_tasks.pop(old_pc_id)
-                task.cancel()
+                    # Cancel the associated bot task!
+                    if old_pc_id in active_tasks:
+                        logger.info(f"Cancelling bot task for old connection {old_pc_id}")
+                        task = active_tasks.pop(old_pc_id)
+                        task.cancel()
 
         pipecat_connection = SmallWebRTCConnection(ice_servers)
         if session_id:
@@ -406,36 +410,32 @@ class DynamicToolManager(FrameProcessor):
 
         if isinstance(frame, StartFrame):
             self._started = True
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, (SystemFrame, ControlFrame)):
+            await self.push_frame(frame, direction)
+        elif self._started:
+            # Scan user messages for human transfer request keywords
+            user_requested = False
+            for msg in self._context.get_messages():
+                if msg.get("role") == "user" and msg.get("content"):
+                    content_lower = msg["content"].lower()
+                    if any(kw in content_lower for kw in [
+                        "human", "agent", "representative", "support", "supervisor",
+                        "person", "operator", "transfer", "connect",
+                        "speak", "talk", "someone", "somebody", "help desk",
+                        "put me through", "customer care", "customer service"
+                    ]):
+                        user_requested = True
+                        break
 
-        # Skip all processing until the pipeline has been properly started.
-        # pre-StartFrame frames (audio, ClientConnectedFrame, etc.) arrive
-        # before the pipeline task manager is initialized and would produce
-        # a flood of harmless-but-noisy "StartFrame not received yet" errors.
-        if not self._started:
-            return
+            # Dynamically set standard tools based on user request keywords presence
+            from pipecat.adapters.schemas.tools_schema import ToolsSchema
+            if user_requested:
+                self._context.set_tools(ToolsSchema(standard_tools=[self._register_interest, self._transfer_to_human]))
+            else:
+                self._context.set_tools(ToolsSchema(standard_tools=[self._register_interest]))
 
-        # Scan user messages for human transfer request keywords
-        user_requested = False
-        for msg in self._context.get_messages():
-            if msg.get("role") == "user" and msg.get("content"):
-                content_lower = msg["content"].lower()
-                if any(kw in content_lower for kw in [
-                    "human", "agent", "representative", "support", "supervisor",
-                    "person", "operator", "transfer", "connect",
-                    "speak", "talk", "someone", "somebody", "help desk",
-                    "put me through", "customer care", "customer service"
-                ]):
-                    user_requested = True
-                    break
-
-        # Dynamically set standard tools based on user request keywords presence
-        from pipecat.adapters.schemas.tools_schema import ToolsSchema
-        if user_requested:
-            self._context.set_tools(ToolsSchema(standard_tools=[self._register_interest, self._transfer_to_human]))
-        else:
-            self._context.set_tools(ToolsSchema(standard_tools=[self._register_interest]))
-
-        await self.push_frame(frame, direction)
+            await self.push_frame(frame, direction)
 
 
 class LanguageSwitcher(FrameProcessor):
@@ -455,53 +455,60 @@ class LanguageSwitcher(FrameProcessor):
         self._session = session
         self._destination_catalog = destination_catalog
         self._current_lang = initial_lang
+        self._started = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame):
-            detected_lang_code = frame.language
-            if detected_lang_code:
-                # Normalize language code to what our system expects (en, hi, ml)
-                from app.languages import normalize_language_code
-                resolved_code = normalize_language_code(detected_lang_code)
+        if isinstance(frame, StartFrame):
+            self._started = True
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, (SystemFrame, ControlFrame)):
+            await self.push_frame(frame, direction)
+        elif self._started:
+            if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame):
+                detected_lang_code = frame.language
+                if detected_lang_code:
+                    # Normalize language code to what our system expects (en, hi, ml)
+                    from app.languages import normalize_language_code
+                    resolved_code = normalize_language_code(detected_lang_code)
 
-                if resolved_code != self._current_lang.code:
-                    logger.info(f"Language switch detected: {self._current_lang.code} -> {resolved_code}")
-                    new_lang = get_language_config(resolved_code)
-                    
-                    # 1. Update LLM context with new system instructions
-                    new_instructions = build_system_instruction(new_lang, self._destination_catalog)
-                    
-                    # Update system message in context
-                    # First, filter out any previous system messages from language switches
-                    msgs = self._context.get_messages()
-                    filtered_msgs = [
-                        m for m in msgs
-                        if not (
-                            m.get("role") == "system"
-                            and isinstance(m.get("content"), str)
-                            and m["content"].startswith("The user is now speaking")
-                        )
-                    ]
-                    self._context.set_messages(filtered_msgs)
+                    if resolved_code != self._current_lang.code:
+                        logger.info(f"Language switch detected: {self._current_lang.code} -> {resolved_code}")
+                        new_lang = get_language_config(resolved_code)
+                        
+                        # 1. Update LLM context with new system instructions
+                        new_instructions = build_system_instruction(new_lang, self._destination_catalog)
+                        
+                        # Update system message in context
+                        # First, filter out any previous system messages from language switches
+                        msgs = self._context.get_messages()
+                        filtered_msgs = [
+                            m for m in msgs
+                            if not (
+                                m.get("role") == "system"
+                                and isinstance(m.get("content"), str)
+                                and m["content"].startswith("The user is now speaking")
+                            )
+                        ]
+                        self._context.set_messages(filtered_msgs)
 
-                    self._context.add_message({
-                        "role": "system", 
-                        "content": f"The user is now speaking {new_lang.label}. {new_instructions}"
-                    })
+                        self._context.add_message({
+                            "role": "system", 
+                            "content": f"The user is now speaking {new_lang.label}. {new_instructions}"
+                        })
 
-                    # 2. Update TTS service language if it's a MultilingualTTS
-                    if hasattr(self._tts, "set_language"):
-                        self._tts.set_language(resolved_code)
+                        # 2. Update TTS service language if it's a MultilingualTTS
+                        if hasattr(self._tts, "set_language"):
+                            self._tts.set_language(resolved_code)
 
-                    # 3. Update STT service language if it's a MultilingualSTTRouter
-                    if hasattr(self._stt, "set_language"):
-                        self._stt.set_language(resolved_code)
-                    
-                    self._current_lang = new_lang
+                        # 3. Update STT service language if it's a MultilingualSTTRouter
+                        if hasattr(self._stt, "set_language"):
+                            self._stt.set_language(resolved_code)
+                        
+                        self._current_lang = new_lang
 
-        await self.push_frame(frame, direction)
+            await self.push_frame(frame, direction)
 
 
 async def _run_agent(
@@ -585,6 +592,20 @@ async def _run_agent(
             summary = f"Destination: {destination}. Client Name: {name}. Email: {email}."
             logger.info(f"Generated warm transfer context: {summary}")
 
+            # Smart routing: check for destination-specific supervisor number in environment
+            target_supervisor = supervisor_number
+            if destination and destination.lower() != "not specified":
+                normalized_dest = destination.strip().lower()
+                for env_key, env_val in os.environ.items():
+                    clean_key = env_key.strip().lower()
+                    if clean_key == f"{normalized_dest}_supervisor":
+                        val = env_val.strip()
+                        # Verify it's not a placeholder like +91xxxxxxxxx or +91xxxxxxxx
+                        if val and not any(c in val.lower() for c in ["x", "placeholder"]):
+                            target_supervisor = val
+                            logger.info(f"Smart Routing: Found supervisor for destination '{destination}': {target_supervisor}")
+                            break
+
             # Save the transfer context in the SQLite DB
             from app.database import save_transfer_context
             try:
@@ -600,12 +621,12 @@ async def _run_agent(
             twiml_content = (
                 f"<Response>"
                 f"<Dial>"
-                f"<Number url=\"{whisper_url}\">{supervisor_number}</Number>"
+                f"<Number url=\"{whisper_url}\">{target_supervisor}</Number>"
                 f"</Dial>"
                 f"</Response>"
             )
             
-            logger.info(f"Initiating redirect to {supervisor_number} on call {call_id} using URL {url} with TwiML screen URL {whisper_url}")
+            logger.info(f"Initiating redirect to {target_supervisor} on call {call_id} using URL {url} with TwiML screen URL {whisper_url}")
             
             try:
                 auth = aiohttp.BasicAuth(account_sid, auth_token)
@@ -687,12 +708,28 @@ async def _run_agent(
         )
 
         class SessionEnder(FrameProcessor):
+            def __init__(self):
+                super().__init__()
+                self._started = False
+
             async def process_frame(self, frame: Frame, direction: FrameDirection):
-                await super().process_frame(frame, direction)
-                await self.push_frame(frame, direction)
+                if isinstance(frame, (SystemFrame, ControlFrame)):
+                    await super().process_frame(frame, direction)
+
+                if isinstance(frame, StartFrame):
+                    self._started = True
+                    await self.push_frame(frame, direction)
+                    return
+
+                if not self._started:
+                    return
+
                 if isinstance(frame, BotStoppedSpeakingFrame) and end_session_after_speaking:
                     logger.info("Gracefully ending AI session after hand-off message")
+                    await self.push_frame(frame, direction)
                     await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+                else:
+                    await self.push_frame(frame, direction)
 
         session_ender = SessionEnder()
         dynamic_tool_manager = DynamicToolManager(context, register_interest, transfer_to_human)
@@ -709,6 +746,7 @@ async def _run_agent(
                 self.rag = rag_client
                 self.k = k
                 self.min_score = min_score
+                self._started = False
 
             @staticmethod
             def _build_query(messages: list[dict]) -> tuple[str | None, str | None]:
@@ -766,7 +804,16 @@ async def _run_agent(
                     context.set_messages(filtered)
 
             async def process_frame(self, frame, direction: FrameDirection):
-                await super().process_frame(frame, direction)
+                if isinstance(frame, (SystemFrame, ControlFrame)):
+                    await super().process_frame(frame, direction)
+
+                if isinstance(frame, StartFrame):
+                    self._started = True
+                    await self.push_frame(frame, direction)
+                    return
+
+                if not self._started:
+                    return
 
                 # User aggregator emits LLMContextFrame downstream to trigger the LLM.
                 if (
@@ -807,8 +854,20 @@ async def _run_agent(
                 super().__init__()
                 self._suppress = False
                 self._seen_text = False
+                self._started = False
 
             async def process_frame(self, frame: Frame, direction: FrameDirection):
+                if isinstance(frame, (SystemFrame, ControlFrame)):
+                    await super().process_frame(frame, direction)
+
+                if isinstance(frame, StartFrame):
+                    self._started = True
+                    await self.push_frame(frame, direction)
+                    return
+
+                if not self._started:
+                    return
+
                 if direction == FrameDirection.DOWNSTREAM:
                     if isinstance(frame, LLMRunFrame):
                         self._suppress = False
@@ -831,7 +890,6 @@ async def _run_agent(
                             if self._suppress:
                                 return
 
-                await super().process_frame(frame, direction)
                 await self.push_frame(frame, direction)
 
         assistant_text_sanitizer = AssistantTextSanitizer()

@@ -57,7 +57,7 @@ def main() -> None:
 
     account_sid = args.sid or os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = args.token or os.getenv("TWILIO_AUTH_TOKEN")
-    to_number = args.to or os.getenv("CALL_TO")
+    to_number = args.to or os.getenv("CALL_TO") or os.getenv("outgoing_number") or os.getenv("OUTGOING_NUMBER")
     from_number = args.from_ or os.getenv("TWILIO_FROM") or os.getenv("TWILIO_NUMBER")
 
     public_base = os.getenv("PUBLIC_BASE_URL")

@@ -194,6 +194,10 @@ async def register_interest(
         "notes": notes,
     }
 
+    out_num = os.environ.get("outgoing_number") or os.environ.get("OUTGOING_NUMBER")
+    if out_num:
+        record["outgoing_number"] = out_num.strip()
+
     offered = _offered_packages()
     outside = destination_name.casefold() not in offered
 

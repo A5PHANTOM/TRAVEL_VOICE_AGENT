@@ -84,7 +84,7 @@ def get_language_config(code: str | None) -> VoiceLanguageConfig:
         greeting="Hi, I'm calling from Lifestyle Travels. Which destination are you planning to go to?",
         developer_hint="Ask one short question at a time and keep the conversation concise.",
         llm_language_rule="Always respond in English.",
-        uses_sarvam=True,
+        uses_sarvam=False,
     )
 
 
