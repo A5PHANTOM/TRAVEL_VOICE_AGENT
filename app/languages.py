@@ -88,7 +88,39 @@ def get_language_config(code: str | None) -> VoiceLanguageConfig:
     )
 
 
-def build_system_instruction(lang: VoiceLanguageConfig, destination_catalog: str, greeting: str | None = None) -> str:
+def build_system_instruction(
+    lang: VoiceLanguageConfig,
+    destination_catalog: str,
+    greeting: str | None = None,
+    customer_context: str | None = None,
+    known_fields: dict | None = None,
+) -> str:
+    skip_hints: list[str] = []
+    if known_fields:
+        if known_fields.get("lead_name"):
+            skip_hints.append("name (already on file)")
+        if known_fields.get("lead_email"):
+            skip_hints.append("email (already on file)")
+        if known_fields.get("duration_days"):
+            skip_hints.append(f"duration ({known_fields['duration_days']} days on file)")
+        if known_fields.get("accommodation"):
+            skip_hints.append(f"accommodation ({known_fields['accommodation']} on file)")
+        if known_fields.get("flight_needed") is not None:
+            flight_label = "yes" if known_fields["flight_needed"] else "no"
+            skip_hints.append(f"flights ({flight_label} on file)")
+
+    skip_clause = ""
+    if skip_hints:
+        skip_clause = (
+            " For returning customers, you may confirm rather than re-ask details already on file: "
+            + ", ".join(skip_hints)
+            + ". Still collect any missing required fields before calling register_interest."
+        )
+
+    memory_clause = ""
+    if customer_context:
+        memory_clause = f"\n\n{customer_context}\n"
+
     base = (
         "You are a helpful travel assistant for Lifestyle Travels. "
         f"{lang.llm_language_rule} "
@@ -97,7 +129,8 @@ def build_system_instruction(lang: VoiceLanguageConfig, destination_catalog: str
         "(4) Travel Duration in days, (5) Accommodation class (budget/mid-range/luxury), "
         "and (6) Flight requirements. "
         "You must ask only one question at a time. Only ask the next question after the user has answered the previous one. "
-        "Do NOT ask for multiple details at once, and do NOT skip any steps in the order. "
+        "Do NOT ask for multiple details at once, and do NOT skip any steps in the order unless customer memory indicates the detail is already on file."
+        f"{skip_clause} "
         "Do NOT ask about booking packages, customizing trips, or other topics outside these six fields. "
         "Remember the destination the client already told you and do not switch to a different country unless they change it. "
         f"If asked what destinations are available, list: {destination_catalog}. "
@@ -115,4 +148,4 @@ def build_system_instruction(lang: VoiceLanguageConfig, destination_catalog: str
         f"Open the conversation with: '{greeting if greeting is not None else lang.greeting}'. "
         "If the conversation is already underway, do NOT say the greeting again; instead, acknowledge the user's response in their language and ask the next question."
     )
-    return base
+    return base + memory_clause

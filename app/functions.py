@@ -212,6 +212,14 @@ async def register_interest(
             row_id = await update_lead(existing_id, destination_name, record)
         else:
             row_id = await save_interest(destination_name, record)
+
+        from app.customer_memory import record_interaction_from_lead
+
+        try:
+            await record_interaction_from_lead(record, lead_id=row_id)
+        except Exception as mem_exc:
+            logger.warning(f"Customer memory update failed: {mem_exc}")
+
         result = {
             "status": "ok",
             "id": row_id,

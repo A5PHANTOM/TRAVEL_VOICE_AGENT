@@ -67,6 +67,15 @@ from app.languages import (
     build_system_instruction,
     get_language_config,
 )
+from app.customer_memory import (
+    build_personalization_context,
+    build_returning_greeting,
+    ensure_customer_memory_seeded,
+    known_fields_from_profile,
+    lookup_customer_profile,
+    normalize_phone,
+    record_interaction_from_lead,
+)
 from app.voice_services import create_stt_tts, resolve_voice_language
 
 load_dotenv(override=True)
@@ -148,6 +157,11 @@ class FallbackVADAnalyzer(VADAnalyzer):
 async def lifespan(app: FastAPI):
     # Initialize DB on startup
     await init_db()
+    try:
+        seeded = await ensure_customer_memory_seeded()
+        logger.info(f"Customer memory: backfilled {seeded} interaction(s) from existing leads")
+    except Exception as e:
+        logger.error(f"Customer memory backfill failed: {e}")
 
     # Pre-load/warm up the AIC model at startup to eliminate latency during calls
     if aic_license_key and AIC_FILTER_AVAILABLE:
@@ -356,6 +370,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, voice_language: str 
                 webrtc_connection=webrtc_connection,
                 params=params,
             ),
+            customer_phone=_resolve_customer_phone(),
             aic_filter=aic_filter,
             voice_language=voice_language,
         )
@@ -385,14 +400,20 @@ async def save_partial_lead_from_history(messages: list[dict[str, Any]], call_id
 
     package_name = record["destination"]
     search_name = record["lead_name"]
+    lead_id = None
     try:
         existing_id = await find_open_lead(package_name, search_name)
         if existing_id:
             logger.info(f"Updating existing partial lead {existing_id} with: {record}")
-            await update_lead(existing_id, package_name, record)
+            lead_id = await update_lead(existing_id, package_name, record)
         else:
             logger.info(f"Saving new partial lead with: {record}")
-            await save_interest(package_name, record)
+            lead_id = await save_interest(package_name, record)
+
+        try:
+            await record_interaction_from_lead(record, lead_id=lead_id, call_id=call_id)
+        except Exception as mem_exc:
+            logger.warning(f"Customer memory update on partial lead failed: {mem_exc}")
     except Exception as e:
         logger.error(f"Failed to save partial lead: {e}")
 
@@ -447,6 +468,8 @@ class LanguageSwitcher(FrameProcessor):
         session: aiohttp.ClientSession,
         destination_catalog: str,
         initial_lang: VoiceLanguageConfig,
+        customer_context: str = "",
+        known_fields: dict[str, Any] | None = None,
     ):
         super().__init__()
         self._context = context
@@ -455,6 +478,8 @@ class LanguageSwitcher(FrameProcessor):
         self._session = session
         self._destination_catalog = destination_catalog
         self._current_lang = initial_lang
+        self._customer_context = customer_context
+        self._known_fields = known_fields or {}
         self._started = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -478,7 +503,12 @@ class LanguageSwitcher(FrameProcessor):
                         new_lang = get_language_config(resolved_code)
                         
                         # 1. Update LLM context with new system instructions
-                        new_instructions = build_system_instruction(new_lang, self._destination_catalog)
+                        new_instructions = build_system_instruction(
+                            new_lang,
+                            self._destination_catalog,
+                            customer_context=self._customer_context or None,
+                            known_fields=self._known_fields or None,
+                        )
                         
                         # Update system message in context
                         # First, filter out any previous system messages from language switches
@@ -511,9 +541,22 @@ class LanguageSwitcher(FrameProcessor):
             await self.push_frame(frame, direction)
 
 
+def _resolve_customer_phone(call_data: dict[str, Any] | None = None) -> str | None:
+    """Best-effort customer phone from telephony metadata or outbound env."""
+    if call_data:
+        for key in ("from_number", "from", "caller", "to_number", "to"):
+            value = call_data.get(key)
+            normalized = normalize_phone(value)
+            if normalized:
+                return normalized
+    env_phone = os.environ.get("outgoing_number") or os.environ.get("OUTGOING_NUMBER")
+    return normalize_phone(env_phone)
+
+
 async def _run_agent(
     transport: BaseTransport,
     call_id: str | None = None,
+    customer_phone: str | None = None,
     aic_filter: Any = None,
     voice_language: str | None = None,
 ):
@@ -646,8 +689,19 @@ async def _run_agent(
                 logger.exception(f"Error calling Twilio API: {e}")
                 await params.result_callback({"status": "failed", "message": f"Exception during Twilio API call: {str(e)}"})
 
-        # Determine initial greeting based on mode
-        initial_greeting = lang.greeting
+        customer_profile = await lookup_customer_profile(phone=customer_phone)
+        if customer_profile:
+            logger.info(
+                f"Returning customer loaded: "
+                f"{customer_profile.get('customer', {}).get('name') or 'unknown'} "
+                f"({customer_profile.get('customer', {}).get('phone') or customer_phone})"
+            )
+
+        customer_context = build_personalization_context(customer_profile)
+        known_fields = known_fields_from_profile(customer_profile)
+
+        # Determine initial greeting — personalize for returning customers
+        initial_greeting = build_returning_greeting(customer_profile, lang.greeting)
 
         destination_catalog = ", ".join(d.title() for d in _known_destinations())
         llm = GroqLLMService(
@@ -656,8 +710,14 @@ async def _run_agent(
                 model="llama-3.3-70b-versatile",
                 temperature=0.7,
                 extra={"frequency_penalty": 0.5, "presence_penalty": 0.5},
-                system_instruction=build_system_instruction(lang, destination_catalog, initial_greeting) + 
-                " IMPORTANT: Be natural and brief. Never repeat yourself or the same sentence twice in a row. If the user repeats themselves, acknowledge it naturally and move to the next question. Do NOT restart the greeting if the conversation is already underway.",
+                system_instruction=build_system_instruction(
+                    lang,
+                    destination_catalog,
+                    initial_greeting,
+                    customer_context=customer_context or None,
+                    known_fields=known_fields or None,
+                )
+                + " IMPORTANT: Be natural and brief. Never repeat yourself or the same sentence twice in a row. If the user repeats themselves, acknowledge it naturally and move to the next question. Do NOT restart the greeting if the conversation is already underway.",
             ),
         )
 
@@ -733,7 +793,16 @@ async def _run_agent(
 
         session_ender = SessionEnder()
         dynamic_tool_manager = DynamicToolManager(context, register_interest, transfer_to_human)
-        language_switcher = LanguageSwitcher(context, stt, tts, session, destination_catalog, lang)
+        language_switcher = LanguageSwitcher(
+            context,
+            stt,
+            tts,
+            session,
+            destination_catalog,
+            lang,
+            customer_context=customer_context,
+            known_fields=known_fields,
+        )
 
         # Insert a small frame processor that injects relevant knowledge snippets
         # NOTE: FrameProcessor and FrameDirection are already imported at module level.
@@ -992,9 +1061,11 @@ async def _run_twilio_bot(websocket: WebSocket):
         transport = await _create_telephony_transport(websocket, params, transport_type, call_data)
 
         call_id = call_data.get("call_id")
+        customer_phone = _resolve_customer_phone(call_data)
         await _run_agent(
             transport,
             call_id=call_id,
+            customer_phone=customer_phone,
             aic_filter=aic_filter,
             voice_language=os.environ.get("VOICE_LANGUAGE"),
         )
@@ -1106,7 +1177,12 @@ async def exotel_media(websocket: WebSocket):
 
         transport = await _create_telephony_transport(websocket, params, transport_type, call_data)
 
-        await _run_agent(transport, aic_filter=aic_filter)
+        customer_phone = _resolve_customer_phone(call_data)
+        await _run_agent(
+            transport,
+            customer_phone=customer_phone,
+            aic_filter=aic_filter,
+        )
     except Exception as e:
         logger.exception(f"Exotel voicebot error: {e}")
 
