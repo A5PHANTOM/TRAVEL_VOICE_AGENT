@@ -29,6 +29,7 @@ class VoiceLanguageConfig:
 
 def normalize_language_code(value: str | None) -> VoiceLanguageCode:
     code = (value or "en").strip().lower().replace("_", "-")
+
     aliases = {
         "en": "en",
         "en-in": "en",
@@ -40,9 +41,12 @@ def normalize_language_code(value: str | None) -> VoiceLanguageCode:
         "ml-in": "ml",
         "malayalam": "ml",
     }
+
     resolved = aliases.get(code)
+
     if resolved in SUPPORTED_LANGUAGES:
         return resolved  # type: ignore[return-value]
+
     return "en"
 
 
@@ -73,7 +77,26 @@ def get_language_config(code: str | None) -> VoiceLanguageConfig:
                 "നിങ്ങൾ ഏത് സ്ഥലത്തേക്കാണ് യാത്ര ചെയ്യാൻ ഉദ്ദേശിക്കുന്നത്?"
             ),
             developer_hint="ഒരു സമയം ഒരു ചെറിയ ചോദ്യം മാത്രം ചോദിക്കുക.",
-            llm_language_rule="എപ്പോഴും മലയാളത്തിൽ മാത്രം മറുപടി നൽകുക.",
+            llm_language_rule="""
+എപ്പോഴും സാധാരണ സംസാരിക്കുന്ന ലളിതമായ മലയാളത്തിൽ മാത്രം മറുപടി നൽകുക.
+
+പ്രധാന നിയമങ്ങൾ:
+- കേരളത്തിലെ ഒരു പ്രൊഫഷണൽ ട്രാവൽ കൺസൾട്ടന്റിനെ പോലെ സംസാരിക്കുക.
+- പുസ്തകങ്ങളിലെ ഭാഷയോ വിവർത്തനം ചെയ്തതുപോലുള്ള മലയാളമോ ഉപയോഗിക്കരുത്.
+- ഒരിക്കലും ഈ വാക്കുകൾ ഉപയോഗിക്കരുത്: "നിങ്ങളുടെ പേര് നല്ലതാണ്", "നിങ്ങളുടെ ഇമെയിൽ നല്ലതാണ്", "സമൃദ്ധമായ സാംസ്കാരിക പൈതൃകം", "യാത്രാവിരലിന് തയ്യാറെടുക്കുന്ന".
+- ഓരോ മറുപടിയും വളരെ ചെറുതായിരിക്കണം (പതിനഞ്ച് വാക്കുകളിൽ താഴെ).
+- ഉപഭോക്താവിന്റെ വിവരങ്ങളെ വെറുതെ പുകഴ്ത്തരുത് (ഉദാഹരണത്തിന്: "നല്ല പേര്", "നല്ല ഇമെയിൽ" എന്ന് പറയരുത്).
+- ലക്ഷ്യസ്ഥലത്തെക്കുറിച്ച് ഉപഭോക്താവ് ചോദിച്ചില്ലെങ്കിൽ നീണ്ട വിവരണം നൽകരുത്.
+- ഒരു സമയം ഒരു ചോദ്യം മാത്രം ചോദിക്കുക.
+- ഉപഭോക്താവിന്റെ മറുപടി ചെറുതായി അംഗീകരിച്ച് അടുത്ത ചോദ്യത്തിലേക്ക് പോവുക.
+
+ഉദാഹരണങ്ങൾ:
+ഉപഭോക്താവ്: എനിക്ക് തായ്‌ലൻഡിലേക്ക് പോകണം.
+മറുപടി: ശരി. യാത്ര എത്ര ദിവസത്തേക്കാണ്? (പേരും ഇമെയിലും അറിയാമെങ്കിൽ നേരിട്ട് ദിവസം ചോദിക്കുക)
+
+ഉപഭോക്താവ്: നാല് ദിവസം.
+മറുപടി: ശരി. ഏത് തരത്തിലുള്ള താമസമാണ് താല്പര്യം? ബജറ്റ് ആണോ ലക്ഷ്വറി ആണോ?
+""",
             uses_sarvam=True,
         )
 
@@ -94,58 +117,60 @@ def build_system_instruction(
     greeting: str | None = None,
     customer_context: str | None = None,
     known_fields: dict | None = None,
+    is_initial: bool = False,
 ) -> str:
     skip_hints: list[str] = []
+
     if known_fields:
         if known_fields.get("lead_name"):
-            skip_hints.append("name (already on file)")
+            skip_hints.append(f"Name (value: '{known_fields['lead_name']}')")
         if known_fields.get("lead_email"):
-            skip_hints.append("email (already on file)")
+            skip_hints.append(f"Email (value: '{known_fields['lead_email']}')")
         if known_fields.get("duration_days"):
-            skip_hints.append(f"duration ({known_fields['duration_days']} days on file)")
+            skip_hints.append(f"Duration (value: {known_fields['duration_days']} days)")
         if known_fields.get("accommodation"):
-            skip_hints.append(f"accommodation ({known_fields['accommodation']} on file)")
+            skip_hints.append(f"Accommodation (value: '{known_fields['accommodation']}')")
         if known_fields.get("flight_needed") is not None:
             flight_label = "yes" if known_fields["flight_needed"] else "no"
-            skip_hints.append(f"flights ({flight_label} on file)")
+            skip_hints.append(f"Flights (value: {flight_label})")
 
     skip_clause = ""
     if skip_hints:
         skip_clause = (
-            " For returning customers, you may confirm rather than re-ask details already on file: "
+            " CRITICAL: The following fields are ALREADY KNOWN and MUST NOT be asked or confirmed again: "
             + ", ".join(skip_hints)
-            + ". Still collect any missing required fields before calling register_interest."
+            + ". Skip them entirely. Do NOT say things like 'I have called you...'. Directly ask only for the remaining missing fields."
         )
 
     memory_clause = ""
     if customer_context:
-        memory_clause = f"\n\n{customer_context}\n"
+        memory_clause = f"\n\nCustomer Memory:\n{customer_context}\n"
+
+    malayalam_extra = ""
+    if lang.code == "ml":
+        malayalam_extra = (
+            " MALAYALAM RULES: Speak like a real Kerala travel executive. "
+            "Use simple spoken conversational Malayalam. "
+            "Never use literary, textbook, poetic, or translated Malayalam. "
+            "Do NOT praise or say things like 'നിങ്ങളുടെ പേര് നല്ലതാണ്', 'നിങ്ങളുടെ ഇമെയിൽ നല്ലതാണ്', 'സമൃദ്ധമായ സാംസ്കാരിക പൈതൃകം', 'യാത്രാവിരലിന് തയ്യാറെടുക്കുന്ന'. "
+            "Keep replies under 10-15 words. Never repeat sentences. Ask only one question at a time. "
+            "Understand that 'വേണ്ട' (veenda) or 'ആവശ്യമില്ല' (aavashyamilla) means 'No' (flight_needed=False). "
+            "Understand that 'വേണം' (veenam) or 'അതെ' (athe) means 'Yes' (flight_needed=True). "
+            "Understand that 'ബഡ്ജറ്റ്' (budget) means 'budget' accommodation tier, 'മിഡ് റേഞ്ച്' (mid-range) means 'mid-range', and 'ലക്ഷ്വറി' (luxury) means 'luxury'."
+        )
 
     base = (
-        "You are a helpful travel assistant for Lifestyle Travels. "
+        "You are a professional travel consultant for Lifestyle Travels. "
         f"{lang.llm_language_rule} "
-        "To gather client details, you must ask questions one by one in the following strict order: "
-        "(1) Destination, (2) your name (ask 'What is your name?'), (3) Email Address, "
-        "(4) Travel Duration in days, (5) Accommodation class (budget/mid-range/luxury), "
-        "and (6) Flight requirements. "
-        "You must ask only one question at a time. Only ask the next question after the user has answered the previous one. "
-        "Do NOT ask for multiple details at once, and do NOT skip any steps in the order unless customer memory indicates the detail is already on file."
+        f"{malayalam_extra} "
+        "Collect these details one-by-one in strict order: (1) Destination, (2) Name, (3) Email, (4) Duration, (5) Accommodation class, (6) Flights. "
+        "Ask ONLY ONE question at a time. "
         f"{skip_clause} "
-        "Do NOT ask about booking packages, customizing trips, or other topics outside these six fields. "
-        "Remember the destination the client already told you and do not switch to a different country unless they change it. "
-        f"If asked what destinations are available, list: {destination_catalog}. "
-        "Do NOT call `register_interest` until you have gathered all six details. "
-        "The email must be a valid address with an @ symbol and domain (e.g. name@example.com). "
-        "If the email sounds unclear, ask the user to repeat it. "
-        "Only after you have collected all six details, call `register_interest` to register the traveler's interest. "
-        "Once register_interest is successfully called, thank the client, inform them that an executive will reach out shortly, and conclude the conversation. "
-        "Keep responses concise, natural for text-to-speech, and limited to one short sentence or one short question at a time. "
-        "Never repeat the user's email, name, or other personal details back verbatim. Never repeat the same sentence twice. "
-        "When the user asks about a destination, visa, package, or policy, use any 'Relevant knowledge' system messages "
-        "to answer with one or two helpful facts about THEIR chosen destination, then ask the next unanswered required field. "
-        "CRITICAL: Always invoke tools natively using the function-calling API. Never write function names, JSON arguments, "
-        "or XML tags in your conversational text responses. "
-        f"Open the conversation with: '{greeting if greeting is not None else lang.greeting}'. "
-        "If the conversation is already underway, do NOT say the greeting again; instead, acknowledge the user's response in their language and ask the next question."
+        "Accept any destination. Catalog: " + destination_catalog + ". "
+        "Call register_interest only after collecting all missing fields. "
+        "Keep responses under 15 words. Use simple spoken language. "
+        "Never repeat the user's name or details back. "
+        "Do NOT repeat the initial greeting since the conversation is already underway."
     )
+
     return base + memory_clause

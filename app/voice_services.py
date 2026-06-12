@@ -265,16 +265,25 @@ def create_stt_tts(
 
 def create_tts_service(lang: VoiceLanguageConfig, session: aiohttp.ClientSession) -> Any:
     """Create a TTS service for a specific language."""
+
     sarvam_api_key = os.environ.get("SARVAM_API_KEY", "").strip()
-    if lang.uses_sarvam and sarvam_api_key:
+    if sarvam_api_key:
         from pipecat.services.sarvam.tts import SarvamHttpTTSService
+        if lang.code == "ml":
+            speaker = os.environ.get("SARVAM_ML_SPEAKER") or "shreya"
+        elif lang.code == "hi":
+            speaker = os.environ.get("SARVAM_HI_SPEAKER") or "shreya"
+        else:
+            speaker = os.environ.get("SARVAM_EN_SPEAKER") or "shreya"
+        model = os.environ.get("SARVAM_TTS_MODEL") or "bulbul:v3"
+        logger.info(f"Creating Sarvam TTS service for language={lang.code} using model={model}, speaker={speaker}")
         return SarvamHttpTTSService(
             api_key=sarvam_api_key,
             aiohttp_session=session,
             settings=SarvamHttpTTSService.Settings(
-                model="bulbul:v3",
+                model=model,
                 language=lang.pipecat_language,
-                voice=_default_sarvam_speaker(lang.code),
+                voice=speaker,
             ),
         )
     

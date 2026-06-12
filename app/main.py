@@ -86,7 +86,7 @@ try:
 except ImportError:
     AIC_FILTER_AVAILABLE = False
 
-aic_license_key = os.environ.get("AIC_LICENSE_KEY", "")
+aic_license_key = "" # Force disabled to prevent model download overhead and echo/repetition loop bugs
 aic_model_id = os.environ.get("AIC_MODEL_ID", "quail-vf-2.1-l-16khz")
 
 import time
@@ -192,6 +192,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize RAG index at startup: {e}")
         _rag_store = None
+
+    # Pre-warm Silero VAD model at startup to eliminate per-call latency
+    try:
+        logger.info("Pre-warming Silero VAD model...")
+        from pipecat.audio.vad.silero import SileroVADAnalyzer as _WarmVAD
+        _warm_vad = _WarmVAD(params=VADParams())
+        await _warm_vad.cleanup()
+        del _warm_vad
+        logger.info("Silero VAD model pre-warmed successfully.")
+    except Exception as e:
+        logger.warning(f"Failed to pre-warm Silero VAD model (will load on first call): {e}")
 
     yield
     # On shutdown disconnect any peer connections
@@ -347,22 +358,23 @@ async def _handle_webrtc_offer(request_data: dict[str, Any], background_tasks: B
 
 async def run_bot(webrtc_connection: SmallWebRTCConnection, voice_language: str | None = None):
     try:
-        if not AIC_FILTER_AVAILABLE:
-            raise RuntimeError("AICFilter library is not available.")
-        if not aic_license_key:
-            raise RuntimeError("AIC_LICENSE_KEY is not set.")
+        aic_filter = None
+        if AIC_FILTER_AVAILABLE and aic_license_key:
+            try:
+                aic_filter = AICFilter(
+                    license_key=aic_license_key,
+                    model_id=aic_model_id,
+                    enhancement_level=1.0,
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize AICFilter: {e}")
 
-        try:
-            aic_filter = AICFilter(
-                license_key=aic_license_key,
-                model_id=aic_model_id,
-                enhancement_level=1.0,
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize AICFilter: {e}")
-            raise
-
-        params = TransportParams(audio_in_enabled=True, audio_out_enabled=True)
+        params = TransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_out_sample_rate=24000,
+            audio_out_channels=1,
+        )
         params.audio_in_filter = aic_filter
 
         await _run_agent(
@@ -470,6 +482,7 @@ class LanguageSwitcher(FrameProcessor):
         initial_lang: VoiceLanguageConfig,
         customer_context: str = "",
         known_fields: dict[str, Any] | None = None,
+        llm: Any = None,
     ):
         super().__init__()
         self._context = context
@@ -481,6 +494,7 @@ class LanguageSwitcher(FrameProcessor):
         self._customer_context = customer_context
         self._known_fields = known_fields or {}
         self._started = False
+        self._llm = llm
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -508,24 +522,34 @@ class LanguageSwitcher(FrameProcessor):
                             self._destination_catalog,
                             customer_context=self._customer_context or None,
                             known_fields=self._known_fields or None,
+                            is_initial=False,
                         )
                         
-                        # Update system message in context
-                        # First, filter out any previous system messages from language switches
+                        if self._llm:
+                            self._llm._settings.system_instruction = (
+                                new_instructions
+                                + " IMPORTANT: Be natural and brief. Never repeat yourself or the same sentence twice in a row. If the user repeats themselves, acknowledge it naturally and move to the next question. Do NOT restart the greeting if the conversation is already underway."
+                            )
+                            logger.info("Successfully updated LLM service system instructions for language switch.")
+                        
+                        # Update system message in context by clearing any old switch system instructions
                         msgs = self._context.get_messages()
                         filtered_msgs = [
                             m for m in msgs
                             if not (
                                 m.get("role") == "system"
                                 and isinstance(m.get("content"), str)
-                                and m["content"].startswith("The user is now speaking")
+                                and (
+                                    m["content"].startswith("The user is now speaking")
+                                    or "MALAYALAM RULES:" in m["content"]
+                                    or "You are a professional travel consultant" in m["content"]
+                                )
                             )
                         ]
                         self._context.set_messages(filtered_msgs)
-
                         self._context.add_message({
-                            "role": "system", 
-                            "content": f"The user is now speaking {new_lang.label}. {new_instructions}"
+                            "role": "system",
+                            "content": f"The user is now speaking {new_lang.label}. You MUST respond in {new_lang.label} only. Do NOT use any other language."
                         })
 
                         # 2. Update TTS service language if it's a MultilingualTTS
@@ -577,6 +601,54 @@ async def _run_agent(
         end_session_after_speaking = False
         lead_saved = False
         greeting_sent = False
+
+        async def register_interest(
+            params: FunctionCallParams,
+            destination: str | None = None,
+            package_type: str | None = None,
+            duration_days: int | None = None,
+            accommodation: str | None = None,
+            flight_needed: bool | None = None,
+            lead_name: str | None = None,
+            lead_email: str | None = None,
+            notes: str | None = None,
+        ):
+            """Save a travel lead from the conversation.
+
+            Args:
+                destination (str): The destination the user wants to travel to.
+                package_type (str | None): Package theme, e.g. beach relaxation or adventure.
+                duration_days (int | None): Number of travel days.
+                accommodation (str | None): Accommodation tier, e.g. budget, luxury, or mid-range.
+                flight_needed (bool | None): Whether flights should be included.
+                lead_name (str | None): Name of the traveler.
+                lead_email (str | None): Email for follow-up.
+                notes (str | None): Any extra notes from the conversation.
+            """
+            nonlocal end_session_after_speaking, lead_saved
+            orig_callback = params.result_callback
+
+            async def custom_callback(result: Any):
+                nonlocal end_session_after_speaking, lead_saved
+                if isinstance(result, dict) and result.get("status") == "ok":
+                    end_session_after_speaking = True
+                    lead_saved = True
+                    logger.info("register_interest succeeded. Setting end_session_after_speaking = True to conclude call.")
+                await orig_callback(result)
+
+            params.result_callback = custom_callback
+            from app.functions import register_interest as app_register_interest
+            await app_register_interest(
+                params=params,
+                destination=destination,
+                package_type=package_type,
+                duration_days=duration_days,
+                accommodation=accommodation,
+                flight_needed=flight_needed,
+                lead_name=lead_name,
+                lead_email=lead_email,
+                notes=notes,
+            )
 
         async def transfer_to_human(params: FunctionCallParams):
             """Connects the caller to a human agent/supervisor. ONLY call this when the user explicitly and directly asks to speak to a human, representative, customer support, supervisor, or asks to transfer. Do NOT call this for regular conversation, questions, or greetings."""
@@ -701,21 +773,23 @@ async def _run_agent(
         known_fields = known_fields_from_profile(customer_profile)
 
         # Determine initial greeting — personalize for returning customers
-        initial_greeting = build_returning_greeting(customer_profile, lang.greeting)
+        initial_greeting = build_returning_greeting(customer_profile, lang.greeting, lang.code)
 
         destination_catalog = ", ".join(d.title() for d in _known_destinations())
+        default_model = "llama-3.3-70b-versatile"
         llm = GroqLLMService(
             api_key=api_key,
             settings=GroqLLMService.Settings(
-                model="llama-3.3-70b-versatile",
-                temperature=0.7,
-                extra={"frequency_penalty": 0.5, "presence_penalty": 0.5},
+                model=os.environ.get("GROQ_MODEL", default_model),
+                temperature=0.65,
+                extra={"frequency_penalty": 0.6, "presence_penalty": 0.6},
                 system_instruction=build_system_instruction(
                     lang,
                     destination_catalog,
                     initial_greeting,
                     customer_context=customer_context or None,
                     known_fields=known_fields or None,
+                    is_initial=True,
                 )
                 + " IMPORTANT: Be natural and brief. Never repeat yourself or the same sentence twice in a row. If the user repeats themselves, acknowledge it naturally and move to the next question. Do NOT restart the greeting if the conversation is already underway.",
             ),
@@ -745,10 +819,14 @@ async def _run_agent(
                 logger.error(f"Failed to initialize primary AIC VAD: {e}")
 
         logger.info("Initializing fallback VAD: SileroVADAnalyzer")
-        fallback_vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, confidence=0.5))
+        fallback_vad = SileroVADAnalyzer(params=VADParams(min_volume=0.2, confidence=0.5))
 
-        logger.info("Running with Silero VAD directly.")
-        vad_analyzer = fallback_vad
+        if primary_vad:
+            logger.info("Using FallbackVADAnalyzer with StartupProtectedAICVADAnalyzer and Silero VAD.")
+            vad_analyzer = FallbackVADAnalyzer(primary_vad, fallback_vad)
+        else:
+            logger.info("Running with Silero VAD directly.")
+            vad_analyzer = fallback_vad
 
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context,
@@ -802,6 +880,7 @@ async def _run_agent(
             lang,
             customer_context=customer_context,
             known_fields=known_fields,
+            llm=llm,
         )
 
         # Insert a small frame processor that injects relevant knowledge snippets
@@ -917,12 +996,10 @@ async def _run_agent(
         rag_augmenter = RAGAugmenter(rag) if rag is not None else None
 
         class AssistantTextSanitizer(FrameProcessor):
-            """Drop LLM text that looks like a leaked tool call before it reaches TTS."""
+            """Clean LLM text that looks like a leaked tool call before it reaches TTS."""
 
             def __init__(self):
                 super().__init__()
-                self._suppress = False
-                self._seen_text = False
                 self._started = False
 
             async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -937,27 +1014,22 @@ async def _run_agent(
                 if not self._started:
                     return
 
-                if direction == FrameDirection.DOWNSTREAM:
-                    if isinstance(frame, LLMRunFrame):
-                        self._suppress = False
-                        self._seen_text = False
-                    elif isinstance(frame, TextFrame) and frame.text:
-                        text = frame.text.strip()
-                        if text:
-                            if not self._seen_text:
-                                self._seen_text = True
-                                if (
-                                    text.startswith("<")
-                                    or text.startswith("{")
-                                    or "function=" in text
-                                    or "register_interest" in text
-                                    or LEAKED_FUNCTION_TEXT_RE.search(text)
-                                ):
-                                    logger.warning(f"Suppressing leaked tool call stream starting with: {text!r}")
-                                    self._suppress = True
-                            
-                            if self._suppress:
-                                return
+                if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TextFrame) and frame.text:
+                    text = frame.text
+                    # Remove XML-like function tags: <function=name>args</function>
+                    text = re.sub(r"<[^>]*function[^>]*>.*?</[^>]*function[^>]*>", "", text, flags=re.IGNORECASE | re.DOTALL)
+                    text = re.sub(r"<[^>]*function[^>]*>", "", text, flags=re.IGNORECASE)
+                    text = re.sub(r"</[^>]*function[^>]*>", "", text, flags=re.IGNORECASE)
+                    
+                    # Remove raw JSON objects
+                    text = re.sub(r"\{\s*\"[a-zA-Z_]+\"\s*:.*?\}", "", text, flags=re.DOTALL)
+                    
+                    # Remove lines containing function= or register_interest
+                    lines = text.splitlines()
+                    cleaned_lines = [line for line in lines if "function=" not in line.lower() and "register_interest" not in line.lower()]
+                    text = "\n".join(cleaned_lines)
+                    
+                    frame.text = text
 
                 await self.push_frame(frame, direction)
 
@@ -1039,20 +1111,16 @@ async def _run_twilio_bot(websocket: WebSocket):
         # Let the parser read the initial handshake messages and determine provider
         transport_type, call_data = await parse_telephony_websocket(websocket)
 
-        if not AIC_FILTER_AVAILABLE:
-            raise RuntimeError("AICFilter library is not available.")
-        if not aic_license_key:
-            raise RuntimeError("AIC_LICENSE_KEY is not set.")
-
-        try:
-            aic_filter = AICFilter(
-                license_key=aic_license_key,
-                model_id=aic_model_id,
-                enhancement_level=1.0,
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize AICFilter: {e}")
-            raise
+        aic_filter = None
+        if AIC_FILTER_AVAILABLE and aic_license_key:
+            try:
+                aic_filter = AICFilter(
+                    license_key=aic_license_key,
+                    model_id=aic_model_id,
+                    enhancement_level=1.0,
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize AICFilter: {e}")
 
         params = FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True)
         params.audio_in_filter = aic_filter
@@ -1061,7 +1129,11 @@ async def _run_twilio_bot(websocket: WebSocket):
         transport = await _create_telephony_transport(websocket, params, transport_type, call_data)
 
         call_id = call_data.get("call_id")
-        customer_phone = _resolve_customer_phone(call_data)
+        customer_phone = websocket.query_params.get("customer_phone")
+        if not customer_phone:
+            customer_phone = _resolve_customer_phone(call_data)
+        else:
+            customer_phone = normalize_phone(customer_phone)
         await _run_agent(
             transport,
             call_id=call_id,
@@ -1090,14 +1162,44 @@ async def twilio_voice(request: Request):
     """Return TwiML that connects an incoming call to the Twilio media websocket."""
     # Twilio requires a WebSocket URL (ws:// or wss://) for Media Streams.
     public = _get_public_base_url(request)
-    from urllib.parse import urlparse
+    from urllib.parse import urlparse, quote
 
     parsed = urlparse(public)
     # Some deployments may provide a value without a netloc (e.g. missing scheme)
     # Fallback to parsed.path if netloc is empty. Strip whitespace to avoid accidental newlines.
     host = (parsed.netloc or parsed.path).strip().lstrip("/").rstrip("/")
     ws_scheme = "wss" if parsed.scheme in ("https", "wss") else "ws"
+
+    # Extract call parameters to identify customer phone number
+    params = {}
+    if request.method == "POST":
+        try:
+            form_data = await request.form()
+            params = dict(form_data)
+        except Exception:
+            pass
+    if not params:
+        params = dict(request.query_params)
+
+    from_num = params.get("From", "")
+    to_num = params.get("To", "")
+    direction = params.get("Direction", "")
+    custom_to = params.get("to_number", "")
+    if custom_to:
+        to_num = custom_to
+
+    twilio_from = os.environ.get("TWILIO_FROM") or os.environ.get("TWILIO_NUMBER") or ""
+    
+    # In outbound calls, customer is To; in inbound calls, customer is From.
+    is_outbound = direction.startswith("outbound") or (
+        twilio_from and normalize_phone(from_num) == normalize_phone(twilio_from)
+    )
+    customer_phone = to_num if is_outbound else from_num
+
     websocket_url = f"{ws_scheme}://{host}/twilio/media"
+    if customer_phone:
+        websocket_url += f"?customer_phone={quote(customer_phone)}"
+
     logger.debug(f"Twilio Stream URL: {websocket_url}")
     # Return TwiML that immediately instructs Twilio to open the Media Stream.
     twiml = (
@@ -1107,6 +1209,7 @@ async def twilio_voice(request: Request):
         f"</Response>"
     )
     return Response(content=twiml, media_type="application/xml")
+
 
 
 @app.websocket("/twilio/media")
@@ -1157,20 +1260,16 @@ async def exotel_media(websocket: WebSocket):
         if transport_type != "exotel":
             raise RuntimeError(f"Unexpected telephony provider for /exotel/media: {transport_type}")
 
-        if not AIC_FILTER_AVAILABLE:
-            raise RuntimeError("AICFilter library is not available.")
-        if not aic_license_key:
-            raise RuntimeError("AIC_LICENSE_KEY is not set.")
-
-        try:
-            aic_filter = AICFilter(
-                license_key=aic_license_key,
-                model_id=aic_model_id,
-                enhancement_level=1.0,
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize AICFilter: {e}")
-            raise
+        aic_filter = None
+        if AIC_FILTER_AVAILABLE and aic_license_key:
+            try:
+                aic_filter = AICFilter(
+                    license_key=aic_license_key,
+                    model_id=aic_model_id,
+                    enhancement_level=1.0,
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize AICFilter: {e}")
 
         params = FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True)
         params.audio_in_filter = aic_filter
@@ -1331,4 +1430,3 @@ async def api_reports():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 7860)))
-

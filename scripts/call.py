@@ -61,7 +61,11 @@ def main() -> None:
     from_number = args.from_ or os.getenv("TWILIO_FROM") or os.getenv("TWILIO_NUMBER")
 
     public_base = os.getenv("PUBLIC_BASE_URL")
-    url = args.url or (public_base.rstrip("/") + "/twilio/voice" if public_base else None)
+    url = args.url
+    if not url and public_base and to_number:
+        url = public_base.rstrip("/") + f"/twilio/voice?to_number={urllib.parse.quote(to_number)}"
+    elif not url and public_base:
+        url = public_base.rstrip("/") + "/twilio/voice"
 
     missing = [name for name, val in (
         ("TWILIO_ACCOUNT_SID", account_sid),

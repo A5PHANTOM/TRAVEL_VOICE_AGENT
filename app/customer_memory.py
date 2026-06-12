@@ -209,7 +209,7 @@ def build_personalization_context(profile: dict[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
-def build_returning_greeting(profile: dict[str, Any] | None, default_greeting: str) -> str:
+def build_returning_greeting(profile: dict[str, Any] | None, default_greeting: str, lang_code: str = "en") -> str:
     """Personalized opening greeting for a returning customer."""
     if not profile:
         return default_greeting
@@ -218,18 +218,25 @@ def build_returning_greeting(profile: dict[str, Any] | None, default_greeting: s
     name = customer.get("name")
     destinations = customer.get("destinations") or []
 
+    if lang_code == "ml":
+        if name and destinations:
+            last_dest = destinations[-1]
+            return f"ഹലോ {name}, വീണ്ടും സ്വാഗതം. ഇത്തവണയും {last_dest}-ലേക്ക് തന്നെയാണോ യാത്ര?"
+        if name:
+            return f"ഹലോ {name}, വീണ്ടും സ്വാഗതം. ഇത്തവണ എങ്ങോട്ടാണ് യാത്ര പ്ലാൻ ചെയ്യുന്നത്?"
+    elif lang_code == "hi":
+        if name and destinations:
+            last_dest = destinations[-1]
+            return f"नमस्ते {name}, लाइफस्टाइल ट्रेवल्स में आपका स्वागत है। पिछली बार आप {last_dest} जाना चाहते थे। इस बार कहाँ का प्लान है?"
+        if name:
+            return f"नमस्ते {name}, लाइफस्टाइल ट्रेवल्स में आपका स्वागत है। इस बार आप कहाँ जाना चाहते हैं?"
+
+    # Default English (snappy and under 15 words)
     if name and destinations:
         last_dest = destinations[-1]
-        return (
-            f"Hi {name}, welcome back to Lifestyle Travels! "
-            f"I see you were interested in {last_dest} before. "
-            f"Are you planning another trip to {last_dest}, or a different destination?"
-        )
+        return f"Hi {name}, welcome back! Are you planning to travel to {last_dest} again, or somewhere else?"
     if name:
-        return (
-            f"Hi {name}, welcome back to Lifestyle Travels! "
-            "Which destination are you planning to go to this time?"
-        )
+        return f"Hi {name}, welcome back! Where are you planning to travel this time?"
     return default_greeting
 
 

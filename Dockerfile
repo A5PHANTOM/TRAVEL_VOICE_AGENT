@@ -12,7 +12,7 @@ COPY . /app
 
 # Install local pipecat and extras (webrtc, deepgram, groq)
 RUN pip install --upgrade pip
-RUN pip install -e ./pipecat[webrtc,deepgram,groq,sarvam]
+RUN pip install -e ./pipecat[webrtc,deepgram,groq,sarvam,cartesia]
 
 # Additional dependencies — faiss-cpu + scikit-learn replace chromadb entirely.
 # No ONNX model downloads, no GPU packages, instant startup.

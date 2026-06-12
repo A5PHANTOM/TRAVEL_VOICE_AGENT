@@ -6,6 +6,9 @@ services:
     environment:
       - DEEPGRAM_API_KEY
       - SARVAM_API_KEY
+      - CARTESIA_API_KEY
+      - CARTESIA_VOICE_ID
+      - CARTESIA_MODEL_ID
       - VOICE_LANGUAGE
       - GROQ_API_KEY
       - OPENAI_API_KEY
