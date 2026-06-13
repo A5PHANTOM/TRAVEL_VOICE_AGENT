@@ -266,6 +266,19 @@ def create_stt_tts(
 def create_tts_service(lang: VoiceLanguageConfig, session: aiohttp.ClientSession) -> Any:
     """Create a TTS service for a specific language."""
 
+    cartesia_api_key = os.environ.get("CARTESIA_API_KEY", "").strip()
+    if cartesia_api_key and lang.code == "ml":
+        from pipecat.services.cartesia.tts import CartesiaHttpTTSService
+        voice_id = os.environ.get("CARTESIA_ML_VOICE_ID") or "b426013c-002b-4e89-8874-8cd20b68373a" # Latha - Friendly Host
+        model = os.environ.get("CARTESIA_MODEL_ID") or "sonic-3.5"
+        logger.info(f"Creating Cartesia TTS service for Malayalam using model={model}, voice={voice_id}")
+        return CartesiaHttpTTSService(
+            api_key=cartesia_api_key,
+            voice_id=voice_id,
+            model=model,
+            aiohttp_session=session,
+        )
+
     sarvam_api_key = os.environ.get("SARVAM_API_KEY", "").strip()
     if sarvam_api_key:
         from pipecat.services.sarvam.tts import SarvamHttpTTSService
@@ -286,6 +299,7 @@ def create_tts_service(lang: VoiceLanguageConfig, session: aiohttp.ClientSession
                 voice=speaker,
             ),
         )
+
     
     deepgram_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
     if not deepgram_key:

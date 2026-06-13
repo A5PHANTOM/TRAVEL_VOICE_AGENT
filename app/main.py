@@ -153,6 +153,39 @@ class FallbackVADAnalyzer(VADAnalyzer):
         await self.fallback_vad.cleanup()
 
 
+class ParameterGuardedVADAnalyzer(VADAnalyzer):
+    def __init__(self, inner_vad: VADAnalyzer, confidence: float = 0.75, min_volume: float = 0.25):
+        super().__init__(params=inner_vad.params)
+        self.inner_vad = inner_vad
+        self.locked_confidence = confidence
+        self.locked_min_volume = min_volume
+
+    def num_frames_required(self) -> int:
+        return self.inner_vad.num_frames_required()
+
+    def set_sample_rate(self, sample_rate: int):
+        super().set_sample_rate(sample_rate)
+        self.inner_vad.set_sample_rate(sample_rate)
+
+    def set_params(self, params: VADParams):
+        guarded_params = VADParams(
+            confidence=self.locked_confidence,
+            start_secs=params.start_secs,
+            stop_secs=params.stop_secs,
+            min_volume=self.locked_min_volume
+        )
+        logger.info(f"Guarding VAD params. Overriding to: confidence={guarded_params.confidence}, min_volume={guarded_params.min_volume}")
+        super().set_params(guarded_params)
+        self.inner_vad.set_params(guarded_params)
+
+    def voice_confidence(self, buffer: bytes) -> float:
+        return self.inner_vad.voice_confidence(buffer)
+
+    async def cleanup(self):
+        await self.inner_vad.cleanup()
+
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize DB on startup
@@ -819,7 +852,7 @@ async def _run_agent(
                 logger.error(f"Failed to initialize primary AIC VAD: {e}")
 
         logger.info("Initializing fallback VAD: SileroVADAnalyzer")
-        fallback_vad = SileroVADAnalyzer(params=VADParams(min_volume=0.2, confidence=0.5))
+        fallback_vad = SileroVADAnalyzer(params=VADParams(min_volume=0.25, confidence=0.75))
 
         if primary_vad:
             logger.info("Using FallbackVADAnalyzer with StartupProtectedAICVADAnalyzer and Silero VAD.")
@@ -827,6 +860,9 @@ async def _run_agent(
         else:
             logger.info("Running with Silero VAD directly.")
             vad_analyzer = fallback_vad
+
+        vad_analyzer = ParameterGuardedVADAnalyzer(vad_analyzer, confidence=0.75, min_volume=0.25)
+
 
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context,
@@ -839,7 +875,7 @@ async def _run_agent(
                         TranscriptionUserTurnStartStrategy(enable_interruptions=False),
                     ],
                     stop=[
-                        SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.8),
+                        SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=1.2),
                     ],
                 ),
             ),

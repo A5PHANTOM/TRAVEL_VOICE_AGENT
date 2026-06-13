@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
+import os
 
 from pipecat.transcriptions.language import Language
 
@@ -59,11 +60,11 @@ def get_language_config(code: str | None) -> VoiceLanguageConfig:
             label="Hindi",
             pipecat_language=Language.HI_IN,
             greeting=(
-                "नमस्कार, मैं लाइफ़स्टाइल ट्रैवल्स से बोल रहा हूँ। "
+                "नमस्कार, मैं लाइफ़स्टाइल ट्रैवल्स से बात कर रही हूँ। "
                 "आप किस गंतव्य की यात्रा की योजना बना रहे हैं?"
             ),
-            developer_hint="एक समय में एक छोटा सवाल पूछें और बातचीत संक्षिप्त रखें।",
-            llm_language_rule="हमेशा हिंदी में जवाब दें।",
+            developer_hint="बातचीत को बहुत ही विनम्र, सौम्य और शांत रखें। 'आप' शब्द का प्रयोग करें। एक समय में एक छोटा सवाल पूछें।",
+            llm_language_rule="हमेशा हिंदी में जवाब दें। बहुत ही विनम्र, आदरपूर्ण और शांत लहजे में बात करें। ग्राहक के लिए हमेशा आदरसूचक शब्द 'आप' का प्रयोग करें। जवाब 20 शब्दों से कम रखें।",
             uses_sarvam=True,
         )
 
@@ -74,28 +75,29 @@ def get_language_config(code: str | None) -> VoiceLanguageConfig:
             pipecat_language=Language.ML_IN,
             greeting=(
                 "നമസ്കാരം, ലൈഫ്‌സ്റ്റൈൽ ട്രാവൽസിൽ നിന്നാണ് ഞാൻ വിളിക്കുന്നത്. "
-                "നിങ്ങൾ ഏത് സ്ഥലത്തേക്കാണ് യാത്ര ചെയ്യാൻ ഉദ്ദേശിക്കുന്നത്?"
+                "താങ്കൾ ഏത് സ്ഥലത്തേക്കാണ് യാത്ര ചെയ്യാൻ ഉദ്ദേശിക്കുന്നത്?"
             ),
-            developer_hint="ഒരു സമയം ഒരു ചെറിയ ചോദ്യം മാത്രം ചോദിക്കുക.",
+            developer_hint="വളരെ ശാന്തമായും മാന്യമായും സംസാരിക്കുക. ഒരു സമയം ഒരു ചെറിയ ചോദ്യം മാത്രം ചോദിക്കുക.",
             llm_language_rule="""
 എപ്പോഴും സാധാരണ സംസാരിക്കുന്ന ലളിതമായ മലയാളത്തിൽ മാത്രം മറുപടി നൽകുക.
 
 പ്രധാന നിയമങ്ങൾ:
-- കേരളത്തിലെ ഒരു പ്രൊഫഷണൽ ട്രാവൽ കൺസൾട്ടന്റിനെ പോലെ സംസാരിക്കുക.
+- വളരെ മാന്യമായും ശാന്തമായും സംസാരിക്കുക. 'താങ്കൾ' (respectful you), 'താങ്കളുടെ' (your) പോലെയുള്ള ബഹുമാനസൂചകമായ പദങ്ങൾ ഉപയോഗിക്കുക.
+- കേരളത്തിലെ ഒരു പ്രൊഫഷണൽ ട്രാവൽ കൺസൾട്ടന്റിനെ പോലെ വളരെ സൗഹൃദപരമായും മാന്യമായും സംസാരിക്കുക.
 - പുസ്തകങ്ങളിലെ ഭാഷയോ വിവർത്തനം ചെയ്തതുപോലുള്ള മലയാളമോ ഉപയോഗിക്കരുത്.
 - ഒരിക്കലും ഈ വാക്കുകൾ ഉപയോഗിക്കരുത്: "നിങ്ങളുടെ പേര് നല്ലതാണ്", "നിങ്ങളുടെ ഇമെയിൽ നല്ലതാണ്", "സമൃദ്ധമായ സാംസ്കാരിക പൈതൃകം", "യാത്രാവിരലിന് തയ്യാറെടുക്കുന്ന".
-- ഓരോ മറുപടിയും വളരെ ചെറുതായിരിക്കണം (പതിനഞ്ച് വാക്കുകളിൽ താഴെ).
+- ഓരോ മറുപടിയും ചെറുതായിരിക്കണം (ഇരുപത് വാക്കുകളിൽ താഴെ).
 - ഉപഭോക്താവിന്റെ വിവരങ്ങളെ വെറുതെ പുകഴ്ത്തരുത് (ഉദാഹരണത്തിന്: "നല്ല പേര്", "നല്ല ഇമെയിൽ" എന്ന് പറയരുത്).
 - ലക്ഷ്യസ്ഥലത്തെക്കുറിച്ച് ഉപഭോക്താവ് ചോദിച്ചില്ലെങ്കിൽ നീണ്ട വിവരണം നൽകരുത്.
 - ഒരു സമയം ഒരു ചോദ്യം മാത്രം ചോദിക്കുക.
-- ഉപഭോക്താവിന്റെ മറുപടി ചെറുതായി അംഗീകരിച്ച് അടുത്ത ചോദ്യത്തിലേക്ക് പോവുക.
+- ഉപഭോക്താവിന്റെ മറുപടി വളരെ മാന്യമായി അംഗീകരിച്ച് അടുത്ത ചോദ്യത്തിലേക്ക് പോവുക.
 
 ഉദാഹരണങ്ങൾ:
-ഉപഭോക്താവ്: എനിക്ക് തായ്‌ലൻഡിലേക്ക് പോകണം.
-മറുപടി: ശരി. യാത്ര എത്ര ദിവസത്തേക്കാണ്? (പേരും ഇമെയിലും അറിയാമെങ്കിൽ നേരിട്ട് ദിവസം ചോദിക്കുക)
+ഉപഭോക്ധാവ്: എനിക്ക് തായ്‌ലൻഡിലേക്ക് പോകണം.
+മറുപടി: തീർച്ചയായും സഹായിക്കാം. എത്ര ദിവസത്തെ യാത്രയാണ് താങ്കൾ പ്ലാൻ ചെയ്യുന്നത്?
 
 ഉപഭോക്താവ്: നാല് ദിവസം.
-മറുപടി: ശരി. ഏത് തരത്തിലുള്ള താമസമാണ് താല്പര്യം? ബജറ്റ് ആണോ ലക്ഷ്വറി ആണോ?
+മറുപടി: ശരി, താങ്കൾക്ക് ഏത് തരത്തിലുള്ള താമസമാണ് താല്പര്യം? ബജറ്റ് ആണോ ലക്ഷ്വറി ആണോ?
 """,
             uses_sarvam=True,
         )
@@ -105,8 +107,8 @@ def get_language_config(code: str | None) -> VoiceLanguageConfig:
         label="English",
         pipecat_language=Language.EN_IN,
         greeting="Hi, I'm calling from Lifestyle Travels. Which destination are you planning to go to?",
-        developer_hint="Ask one short question at a time and keep the conversation concise.",
-        llm_language_rule="Always respond in English.",
+        developer_hint="Ask one short question at a time. Be extremely polite and keep the conversation warm and concise.",
+        llm_language_rule="Always respond in English. Be extremely polite, helpful, and warm. Refer to the user respectfully, use polite phrases like 'please' or 'Sure, I would be happy to help', and speak at a moderate, calm pace.",
         uses_sarvam=False,
     )
 
@@ -153,7 +155,7 @@ def build_system_instruction(
             "Use simple spoken conversational Malayalam. "
             "Never use literary, textbook, poetic, or translated Malayalam. "
             "Do NOT praise or say things like 'നിങ്ങളുടെ പേര് നല്ലതാണ്', 'നിങ്ങളുടെ ഇമെയിൽ നല്ലതാണ്', 'സമൃദ്ധമായ സാംസ്കാരിക പൈതൃകം', 'യാത്രാവിരലിന് തയ്യാറെടുക്കുന്ന'. "
-            "Keep replies under 10-15 words. Never repeat sentences. Ask only one question at a time. "
+            "Keep replies under 20 words. Never repeat sentences. Ask only one question at a time. "
             "Understand that 'വേണ്ട' (veenda) or 'ആവശ്യമില്ല' (aavashyamilla) means 'No' (flight_needed=False). "
             "Understand that 'വേണം' (veenam) or 'അതെ' (athe) means 'Yes' (flight_needed=True). "
             "Understand that 'ബഡ്ജറ്റ്' (budget) means 'budget' accommodation tier, 'മിഡ് റേഞ്ച്' (mid-range) means 'mid-range', and 'ലക്ഷ്വറി' (luxury) means 'luxury'."
@@ -168,7 +170,7 @@ def build_system_instruction(
         f"{skip_clause} "
         "Accept any destination. Catalog: " + destination_catalog + ". "
         "Call register_interest only after collecting all missing fields. "
-        "Keep responses under 15 words. Use simple spoken language. "
+        "Keep responses concise, under 20 words, and speak at a calm, relaxed pace. Use simple spoken language. "
         "Never repeat the user's name or details back. "
         "Do NOT repeat the initial greeting since the conversation is already underway."
     )
