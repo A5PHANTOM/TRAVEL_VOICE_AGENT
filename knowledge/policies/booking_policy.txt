@@ -1,0 +1,4 @@
+Booking Policy (sample)
+- Bookings require a deposit of 20% unless specified otherwise.
+- Full payment required 14 days before travel for most packages.
+- Changes to travel dates subject to availability and change fees.

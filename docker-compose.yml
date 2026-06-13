@@ -1,4 +1,3 @@
-version: '3.8'
 services:
   app:
     build: .
@@ -6,10 +5,29 @@ services:
       - "7860:7860"
     environment:
       - DEEPGRAM_API_KEY
+      - SARVAM_API_KEY
+      - CARTESIA_API_KEY
+      - CARTESIA_VOICE_ID
+      - CARTESIA_MODEL_ID
+      - VOICE_LANGUAGE
       - GROQ_API_KEY
       - OPENAI_API_KEY
+      - OPENAI_ADMIN_KEY
+      - TWILIO_ACCOUNT_SID
+      - TWILIO_AUTH_TOKEN
+      - PUBLIC_BASE_URL
       - STUN_SERVER
       - PORT=7860
       - DB_PATH=/data/agents.db
+      - AIC_LICENSE_KEY
+      - AIC_MODEL_ID
     volumes:
       - ./data:/data
+      - ./app:/app/app
+      - ./scratch:/app/scratch
+      - ./.env:/app/.env
+      - ./knowledge:/app/knowledge
+      - faiss_db:/app/faiss_db
+
+volumes:
+  faiss_db:

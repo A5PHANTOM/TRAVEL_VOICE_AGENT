@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Any
 
 from loguru import logger
@@ -15,9 +16,95 @@ def _offered_packages() -> set[str]:
     return {p.casefold() for p in items}
 
 
+def _normalize_text(value: str | None) -> str:
+    return (value or "").strip()
+
+
+def _is_placeholder_destination(value: str) -> bool:
+    normalized = value.casefold().strip()
+    normalized = re.sub(r"[^a-z0-9\s-]", "", normalized)
+    if normalized in {
+        "",
+        "unknown",
+        "not specified",
+        "n/a",
+        "na",
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "sure",
+        "ok",
+        "okay",
+        "hi",
+        "hello",
+        "hey",
+        "lot",
+        "then",
+        "com",
+        "code",
+        "is",
+    }:
+        return True
+    if "?" in value or len(value) > 50:
+        return True
+    if any(phrase in normalized for phrase in (
+        "which location", "tell me", "can you", "what are", "hello",
+        "planning for", "all the destination",
+    )):
+        return True
+    return False
+
+
+def _is_placeholder_name(value: str) -> bool:
+    normalized = value.casefold().strip()
+    normalized = re.sub(r"[^a-z\s-]", "", normalized)
+    if normalized in {
+        "",
+        "unknown",
+        "not specified",
+        "n a",
+        "na",
+        "yes",
+        "yeah",
+        "yep",
+        "hi",
+        "hello",
+        "hey",
+        "lot",
+        "com",
+        "code",
+        "is",
+        "velda number",
+        "number in velda",
+    }:
+        return True
+    if "?" in value or len(value) > 50:
+        return True
+    return False
+
+
+def _is_valid_email(value: str) -> bool:
+    if not re.fullmatch(r"[\w\.-]+@[\w\.-]+\.\w+", value):
+        return False
+    local, _, domain = value.partition("@")
+    if len(value) > 100 or len(local) > 64 or len(domain) > 64:
+        return False
+    # Reject common STT garbage (long runs of repeated characters or spaces).
+    if re.search(r"(.)\1{4,}", local):
+        return False
+    if local.count(" ") > 1:
+        return False
+    return True
+
+
+def _is_valid_accommodation(value: str) -> bool:
+    return value.casefold() in {"budget", "mid-range", "mid range", "luxury"}
+
+
 async def register_interest(
     params: FunctionCallParams,
-    destination: str,
+    destination: str | None = None,
     package_type: str | None = None,
     duration_days: int | None = None,
     accommodation: str | None = None,
@@ -38,14 +125,60 @@ async def register_interest(
         lead_email (str | None): Email for follow-up.
         notes (str | None): Any extra notes from the conversation.
     """
-    destination_name = destination.strip() or "unknown"
-    email = (lead_email or "").strip()
-    if not email:
+    destination_name = _normalize_text(destination)
+    if _is_placeholder_destination(destination_name):
+        await params.result_callback(
+            {
+                "status": "needs_destination",
+                "message": "Please ask the client which destination they are planning to travel to.",
+            }
+        )
+        return
+
+    name = _normalize_text(lead_name)
+    if _is_placeholder_name(name):
+        await params.result_callback(
+            {
+                "status": "needs_name",
+                "message": "Please ask the client for their name.",
+            }
+        )
+        return
+
+    email = _normalize_text(lead_email)
+    if not _is_valid_email(email):
         await params.result_callback(
             {
                 "status": "needs_email",
-                "destination": destination_name,
-                "message": "Please ask the client for their email address before ending the conversation or saving the booking.",
+                "message": "Please ask the client for their email address.",
+            }
+        )
+        return
+
+    if duration_days is None or duration_days <= 0:
+        await params.result_callback(
+            {
+                "status": "needs_duration",
+                "message": "Please ask the client for their travel duration in days.",
+            }
+        )
+        return
+
+    accommodation_val = _normalize_text(accommodation)
+    if not _is_valid_accommodation(accommodation_val):
+        await params.result_callback(
+            {
+                "status": "needs_accommodation",
+                "message": "Please ask the client for their accommodation class preference (budget, mid-range, or luxury).",
+            }
+        )
+        return
+
+    if flight_needed is None:
+        await params.result_callback(
+            {
+                "status": "needs_flight",
+                "message": "Please ask the client if they need flights included.",
             }
         )
         return
@@ -54,12 +187,16 @@ async def register_interest(
         "destination": destination_name,
         "package_type": package_type,
         "duration_days": duration_days,
-        "accommodation": accommodation,
+        "accommodation": accommodation_val,
         "flight_needed": flight_needed,
-        "lead_name": lead_name,
+        "lead_name": name,
         "lead_email": email,
         "notes": notes,
     }
+
+    out_num = os.environ.get("outgoing_number") or os.environ.get("OUTGOING_NUMBER")
+    if out_num:
+        record["outgoing_number"] = out_num.strip()
 
     offered = _offered_packages()
     outside = destination_name.casefold() not in offered
@@ -67,7 +204,22 @@ async def register_interest(
     logger.info(f"Registering travel lead destination={destination_name} details={record}")
 
     try:
-        row_id = await save_interest(destination_name, record)
+        # If there's an open partial lead (same name + package, no email), update it
+        from app.database import find_open_lead, update_lead
+
+        existing_id = await find_open_lead(destination_name, lead_name)
+        if existing_id:
+            row_id = await update_lead(existing_id, destination_name, record)
+        else:
+            row_id = await save_interest(destination_name, record)
+
+        from app.customer_memory import record_interaction_from_lead
+
+        try:
+            await record_interaction_from_lead(record, lead_id=row_id)
+        except Exception as mem_exc:
+            logger.warning(f"Customer memory update failed: {mem_exc}")
+
         result = {
             "status": "ok",
             "id": row_id,
