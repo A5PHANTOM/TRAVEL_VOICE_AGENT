@@ -33,3 +33,7 @@ env/
 
 # Docker
 docker-compose.override.yml
+
+# macOS System Files
+.DS_Store
+
